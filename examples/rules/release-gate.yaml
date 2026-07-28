@@ -1,0 +1,44 @@
+version: "1"
+rules:
+  - id: block-failed-production-release
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 100
+    conditions:
+      - field: type
+        op: eq
+        value: RELEASE_CHECK
+      - field: metadata.environment
+        op: eq
+        value: production
+      - field: metadata.status
+        op: regex
+        value: "^(failed|blocked)$"
+    actions:
+      - id: log-release-block
+        executor: log
+        priority: 100
+        params:
+          level: error
+          template: 'release={{.ID}} status={{index .Metadata "status"}} environment=production result=blocked'
+  - id: record-approved-production-release
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 200
+    conditions:
+      - field: type
+        op: eq
+        value: RELEASE_CHECK
+      - field: metadata.environment
+        op: eq
+        value: production
+      - field: metadata.status
+        op: eq
+        value: approved
+    actions:
+      - id: log-release-approval
+        executor: log
+        priority: 100
+        params:
+          level: info
+          template: "release={{.ID}} environment=production result=approved"

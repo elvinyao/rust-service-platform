@@ -1,0 +1,42 @@
+version: "1"
+rules:
+  - id: normalize-deployment-event
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 100
+    conditions:
+      - field: type
+        op: eq
+        value: RAW_DEPLOY
+    actions:
+      - id: log-raw-deployment
+        executor: log
+        priority: 100
+        params:
+          level: info
+          template: "received raw deployment id={{.ID}}"
+      - id: emit-deployment-audit
+        executor: http
+        priority: 200
+        params:
+          method: POST
+          url: "http://127.0.0.1:18081/events"
+          timeout_ms: 3000
+          headers:
+            X-Automation-Source: rule-engine
+          body_template: '{"id":"audit-{{.ID}}","type":"DEPLOY_AUDIT","content":"deployment event normalized","user_id":"automation","metadata":{"source_event":"{{.ID}}"}}'
+  - id: record-deployment-audit
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 200
+    conditions:
+      - field: type
+        op: eq
+        value: DEPLOY_AUDIT
+    actions:
+      - id: log-deployment-audit
+        executor: log
+        priority: 100
+        params:
+          level: info
+          template: 'audit={{.ID}} source={{index .Metadata "source_event"}} status=recorded'

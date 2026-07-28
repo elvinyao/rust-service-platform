@@ -1,0 +1,36 @@
+[package]
+name = "service-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+service-platform = { path = "../service-platform" }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+fake-server = { path = "../fake-server" }
+serde_yaml.workspace = true
+tempfile = "3.27.0"
+tower.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "service-workflow"
+path = "src/main.rs"

@@ -1,0 +1,14 @@
+workflows:
+  - name: WorkflowEngine
+    providers:
+      - yaml
+    mode: single
+    pipeline_order:
+      - yaml
+    action_merge:
+      dedup: true
+      order: priority
+
+action_merge:
+  dedup: true
+  order: priority

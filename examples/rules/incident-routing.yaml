@@ -1,0 +1,38 @@
+version: "1"
+rules:
+  - id: route-high-severity-incident
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 100
+    conditions:
+      - field: type
+        op: eq
+        value: INCIDENT
+      - field: metadata.severity
+        op: regex
+        value: "^(critical|high)$"
+    actions:
+      - id: log-high-severity-incident
+        executor: log
+        priority: 100
+        params:
+          level: warn
+          template: 'incident={{.ID}} severity={{index .Metadata "severity"}} service={{index .Metadata "service"}} summary={{.Content}}'
+  - id: route-checkout-incident
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 200
+    conditions:
+      - field: type
+        op: eq
+        value: INCIDENT
+      - field: metadata.service
+        op: eq
+        value: checkout
+    actions:
+      - id: log-checkout-owner
+        executor: log
+        priority: 200
+        params:
+          level: info
+          template: "route incident={{.ID}} to team=payments-platform"

@@ -1,0 +1,38 @@
+version: "1"
+rules:
+  - id: route-urgent-support-ticket
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 100
+    conditions:
+      - field: type
+        op: eq
+        value: SUPPORT_TICKET
+      - field: metadata.priority
+        op: regex
+        value: "^(p0|p1)$"
+    actions:
+      - id: log-urgent-support-route
+        executor: log
+        priority: 100
+        params:
+          level: warn
+          template: 'ticket={{.ID}} priority={{index .Metadata "priority"}} queue=urgent'
+  - id: route-refund-ticket
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 200
+    conditions:
+      - field: type
+        op: eq
+        value: SUPPORT_TICKET
+      - field: content
+        op: contains
+        value: refund
+    actions:
+      - id: log-billing-route
+        executor: log
+        priority: 200
+        params:
+          level: info
+          template: "ticket={{.ID}} queue=billing reason=refund"

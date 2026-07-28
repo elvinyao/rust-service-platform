@@ -1,0 +1,17 @@
+version: "1"
+rules:
+  - id: yaml_log_aaa
+    workflow: WorkflowEngine
+    enabled: true
+    priority: 100
+    conditions:
+      - field: type
+        op: eq
+        value: AAA
+    actions:
+      - id: log_aaa
+        executor: log
+        priority: 100
+        params:
+          level: info
+          template: "YAML matched event type={{.Type}} id={{.ID}}"

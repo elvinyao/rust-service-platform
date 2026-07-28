@@ -1,0 +1,16 @@
+workflows:
+  - name: WorkflowEngine
+    providers:
+      - yaml
+      - confluence
+    mode: or
+    pipeline_order:
+      - yaml
+      - confluence
+    action_merge:
+      dedup: true
+      order: priority
+
+action_merge:
+  dedup: true
+  order: priority

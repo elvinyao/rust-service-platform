@@ -1,0 +1,2 @@
+# This file is retained only for migration notes.
+# The reference runtime loads config/runtime.yaml, config/rule-engine.yaml, and config/workflow-rules.yaml.

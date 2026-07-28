@@ -1,0 +1,29 @@
+admin:
+  address: "127.0.0.1:18080"
+  read_header_timeout: "5s"
+  read_timeout: "10s"
+  write_timeout: "10s"
+  idle_timeout: "120s"
+
+inputs:
+  websocket:
+    enabled: true
+    server_url: "ws://localhost:8093"
+    path: "/ws"
+    reconnect_interval: "5s"
+
+adapters:
+  confluence:
+    enabled: true
+    api_endpoint: "http://localhost:8090"
+    settings_page_id: "settings-page-1"
+    refresh_interval: "5s"
+  mattermost:
+    enabled: true
+    server_url: "http://localhost:8091"
+    websocket_url: "ws://localhost:8092"
+    api_token: "test-token-123"
+    channel: "test-channel-1"
+  badgedb:
+    enabled: true
+    path: "/tmp/service-workflow-badges.db"
