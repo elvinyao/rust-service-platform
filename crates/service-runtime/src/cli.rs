@@ -163,4 +163,10 @@ mod tests {
                 .contains(&format!("load runtime config {}", missing.display()))
         );
     }
+
+    #[test]
+    fn runtime_paths_from_env_returns_paths() {
+        let paths = RuntimePaths::from_env();
+        assert_eq!(paths.runtime, PathBuf::from("config/runtime.yaml"));
+    }
 }

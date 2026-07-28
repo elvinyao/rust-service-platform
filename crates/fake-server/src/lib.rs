@@ -1030,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_bind_failure_releases_listeners_for_retry() {
-        let blocker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocker = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let mut ports = ephemeral_ports();
         ports.mattermost_http = blocker.local_addr().unwrap().port();
         let manager = FakeApiManager::new(ports);

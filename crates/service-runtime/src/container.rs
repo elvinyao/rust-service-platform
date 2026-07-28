@@ -115,13 +115,24 @@ mod tests {
         let mut config = RuntimeConfig::default();
         config.inputs.websocket.enabled = false;
         config.adapters.badgedb.enabled = true;
-        let container = Container::new("test", config);
+        config.adapters.mattermost.enabled = true;
+        config.adapters.confluence.enabled = true;
+        let container = Container::new("test", config.clone());
 
         container.register_services().await.unwrap();
 
         assert_eq!(container.version(), "test");
+        assert_eq!(container.config().admin.address, config.admin.address);
+        let _cache = container.cache();
         assert!(container.service("BadgeDBService").await.is_some());
-        assert_eq!(container.service_manager().list().await.len(), 1);
+        assert!(container.service("MattermostService").await.is_some());
+        assert!(
+            container
+                .service("ConfluenceSettingsService")
+                .await
+                .is_some()
+        );
+        assert_eq!(container.service_manager().list().await.len(), 3);
         assert!(Arc::ptr_eq(
             &container.health_manager(),
             &container.health_manager()

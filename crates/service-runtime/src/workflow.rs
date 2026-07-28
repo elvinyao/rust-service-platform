@@ -221,4 +221,30 @@ mod tests {
         let filtered = filter_engine_config(config, &RuntimeConfig::default()).unwrap();
         assert_eq!(filtered.workflows[0].providers, vec!["yaml"]);
     }
+
+    #[test]
+    fn validate_adapter_dependencies_checks_confluence_and_mattermost_coupling() {
+        let mut config = EngineConfig::default();
+        config.workflows[0].providers = vec!["confluence".to_owned()];
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.adapters.confluence.enabled = true;
+        runtime.adapters.mattermost.enabled = false;
+
+        assert!(validate_adapter_dependencies(&config, &runtime).is_err());
+
+        runtime.adapters.mattermost.enabled = true;
+        assert!(validate_adapter_dependencies(&config, &runtime).is_ok());
+    }
+
+    #[test]
+    fn filter_engine_config_rejects_empty_providers() {
+        let mut config = EngineConfig::default();
+        config.workflows[0].providers = vec!["confluence".to_owned()];
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.adapters.confluence.enabled = false;
+
+        assert!(filter_engine_config(config, &runtime).is_err());
+    }
 }

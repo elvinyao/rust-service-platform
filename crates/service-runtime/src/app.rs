@@ -528,4 +528,64 @@ mod tests {
         assert!(app.admin_address().await.is_some());
         app.stop().await.unwrap();
     }
+
+    #[test]
+    fn app_configured_admin_address_returns_address() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut config = RuntimeConfig::default();
+        config.admin.address = "127.0.0.1:18080".to_owned();
+        let app = App::new(
+            "test",
+            config,
+            root.join("config/rule-engine.yaml"),
+            root.join("config/workflow-rules.yaml"),
+        );
+        assert_eq!(app.configured_admin_address(), "127.0.0.1:18080");
+        assert!(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(app.admin_address())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_fails_for_invalid_config_or_missing_workflow_rules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut invalid_config = RuntimeConfig::default();
+        invalid_config.admin.address.clear();
+        let app = App::new(
+            "test",
+            invalid_config,
+            root.join("config/rule-engine.yaml"),
+            root.join("config/workflow-rules.yaml"),
+        );
+        assert!(app.start().await.is_err());
+
+        let mut config = RuntimeConfig::default();
+        config.admin.address = "127.0.0.1:0".to_owned();
+        let app_missing_rules = App::new(
+            "test",
+            config,
+            root.join("config/rule-engine.yaml"),
+            PathBuf::from("/definitely/missing/workflow-rules.yaml"),
+        );
+        assert!(app_missing_rules.start().await.is_err());
+    }
+
+    #[test]
+    fn with_cleanup_formats_error_and_cleanup() {
+        let err1 = AppError::new(ErrorType::InvalidInput, "err1");
+        let err2 = AppError::new(ErrorType::ServiceUnavailable, "err2");
+        let combined = with_cleanup(err1, Some(err2));
+        assert_eq!(combined.error_type, ErrorType::InvalidInput);
+        assert!(
+            combined
+                .to_string()
+                .contains("err1; clean up failed startup: err2")
+        );
+
+        let single = with_cleanup(AppError::new(ErrorType::InvalidInput, "err1"), None);
+        assert_eq!(single.to_string(), "err1");
+    }
 }
