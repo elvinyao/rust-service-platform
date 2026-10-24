@@ -1,8 +1,6 @@
 //! Reusable SDK for configurable, rule-driven event processing services.
 
-pub mod concurrency;
 pub mod config;
-pub mod context;
 pub mod errors;
 pub mod executor;
 pub mod health;

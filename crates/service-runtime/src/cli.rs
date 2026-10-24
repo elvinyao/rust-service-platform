@@ -3,13 +3,10 @@
 use std::{env, future::Future, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use service_platform::{
-    config::RuntimeConfig,
-    logger::{self, LoggerConfig},
-};
+use service_platform::logger::{self, LoggerConfig};
 use tokio::time::timeout;
 
-use crate::app::App;
+use crate::{app::App, config::RuntimeConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimePaths {

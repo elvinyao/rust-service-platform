@@ -25,29 +25,9 @@ pub trait Executor: Send + Sync {
 }
 ```
 
-Use a stable, non-empty executor type. An engine rejects duplicate types.
+Use a stable, non-empty executor type. `pipeline::Engine::new` rejects empty and duplicate types and owns the sorted executor map directly.
 
 Lifecycle hooks are optional through their default implementations. Providers start first; executors start only after provider snapshots and executor references pass preflight. Shutdown is reverse order.
-
-## Registry
-
-`executor::Registry` is a concurrent type-to-instance map:
-
-```rust
-let registry = Registry::new();
-registry.register(Arc::new(LogExecutor)).await?;
-let log = registry.get("log").await;
-let types = registry.list_types().await;
-```
-
-Registration rejects:
-
-- an empty type
-- a duplicate type
-
-`list_types` is sorted because the registry uses a `BTreeMap`.
-
-Applications normally let `pipeline::Engine::new` create and own the registry.
 
 ## Templates
 
@@ -256,4 +236,4 @@ Do not treat an empty plan as an error. It means no rules matched.
 - `mattermost`: renders a message and posts through `MattermostService`
 - `db`: creates a demonstration badge record through `BadgeDbService`
 
-They demonstrate service lookup and adapter wiring. Keep application-specific executors outside `service-platform`.
+They demonstrate constructor-injected service-backed executors. Keep application-specific executors outside `service-platform`.

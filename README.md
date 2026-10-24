@@ -110,7 +110,6 @@ The framework supports:
 - strict YAML decoding with unknown-field rejection
 - startup preflight and reverse-order rollback
 - typed partial execution failures
-- bounded worker batches with cooperative cancellation
 
 ## Runtime Profiles
 
@@ -200,16 +199,14 @@ Rules are validated when the provider starts and again when a snapshot is compos
 | --- | --- |
 | `ruleengine` | Models, validation, YAML/static providers, matching, and composition |
 | `pipeline` | Provider and executor lifecycle, preflight, processing, snapshots |
-| `executor` | Executor trait, registry, templates, log and HTTP executors |
-| `config` | Strict runtime YAML, duration parsing, validation, environment overrides |
+| `executor` | Executor trait, templates, log and HTTP executors |
+| `config` | Admin listener config, duration parsing, and validation helpers |
 | `runtime` | Fail-fast admin server with configured HTTP timeouts |
-| `health` | Checkers, reporters, service health, caching, HTTP routes |
+| `health` | Checkers, service health, caching, HTTP routes |
 | `logger` | Structured tracing configuration and rotating file output |
-| `context` | Request and operation correlation fields |
 | `errors` | Typed application errors and structured fields |
-| `concurrency` | Ordered bounded batches and cooperative cancellation |
 
-`crates/service-runtime` owns the reference application, DI container, service/workflow managers, and demo adapters. Framework consumers normally depend only on `service-platform`.
+`crates/service-runtime` owns the reference application, runtime/adapter configuration, service manager, workflow engine, and demo adapters. Framework consumers normally depend only on `service-platform`.
 
 ## Admin API
 
@@ -293,7 +290,6 @@ docs/                     User, developer, and architecture guides
 - [Configuration](docs/configuration.md)
 - [Rule Engine](docs/rule-engine.md)
 - [Executors](docs/executors.md)
-- [Bounded Concurrency](docs/concurrency.md)
 - [Reference Adapters](docs/adapters.md)
 - [Framework Cookbook](docs/cookbook.md)
 - [Architecture and Design](docs/design.md)

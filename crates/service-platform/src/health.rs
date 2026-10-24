@@ -2,9 +2,7 @@
 
 use std::{
     collections::BTreeMap,
-    future::Future,
     panic::AssertUnwindSafe,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,18 +20,14 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
-use reqwest::{Client, Method, StatusCode as HttpStatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 use tokio::{
-    net::TcpStream,
     sync::{Mutex, RwLock},
     task::JoinSet,
     time::{Instant as TokioInstant, timeout, timeout_at},
 };
-
-use crate::errors::Result;
 
 const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -209,12 +203,6 @@ pub trait Checker: Send + Sync {
     async fn check(&self) -> CheckResult;
 }
 
-/// Supplies a complete dependency or subsystem health report.
-#[async_trait]
-pub trait Reporter: Send + Sync {
-    async fn report_health(&self) -> Report;
-}
-
 #[async_trait]
 pub trait ServiceHealth: Send + Sync {
     fn name(&self) -> &str;
@@ -347,290 +335,6 @@ impl Checker for RuntimeWorkerChecker {
     }
 }
 
-/// Checks TCP connectivity and latency to one host and port.
-#[derive(Debug, Clone)]
-pub struct ConnectivityChecker {
-    host: String,
-    port: u16,
-    timeout: Duration,
-    expected_latency: Duration,
-}
-
-impl ConnectivityChecker {
-    pub fn new(host: impl Into<String>, port: u16) -> Self {
-        Self {
-            host: host.into(),
-            port,
-            timeout: Duration::from_secs(1),
-            expected_latency: Duration::from_millis(500),
-        }
-    }
-
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expected_latency(mut self, expected_latency: Duration) -> Self {
-        self.expected_latency = expected_latency;
-        self
-    }
-}
-
-#[async_trait]
-impl Checker for ConnectivityChecker {
-    async fn check(&self) -> CheckResult {
-        let address = format!("{}:{}", self.host, self.port);
-        let started = Instant::now();
-        let connection = timeout(self.timeout, TcpStream::connect(&address)).await;
-        let elapsed = started.elapsed();
-        let mut result =
-            CheckResult::new(format!("connectivity-{address}"), Category::Connectivity)
-                .with_level(Level::Critical)
-                .with_detail("latency_ms", millis(elapsed));
-        result = match connection {
-            Ok(Ok(_)) if elapsed > self.expected_latency => result.with_status(
-                Status::Degraded,
-                format!(
-                    "High latency connecting to {address}: {}ms",
-                    elapsed.as_millis()
-                ),
-            ),
-            Ok(Ok(_)) => result.with_status(
-                Status::Up,
-                format!(
-                    "Successfully connected to {address} in {}ms",
-                    elapsed.as_millis()
-                ),
-            ),
-            Ok(Err(error)) => result.with_status(
-                Status::Down,
-                format!("Failed to connect to {address}: {error}"),
-            ),
-            Err(_) => {
-                result.with_status(Status::Down, format!("Connection to {address} timed out"))
-            }
-        };
-        result.complete()
-    }
-}
-
-/// Checks one HTTP endpoint's status and latency.
-#[derive(Clone)]
-pub struct HttpEndpointChecker {
-    url: String,
-    method: Method,
-    timeout: Duration,
-    expected_status: HttpStatusCode,
-    expected_latency: Duration,
-    client: Client,
-}
-
-impl HttpEndpointChecker {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            method: Method::GET,
-            timeout: Duration::from_secs(2),
-            expected_status: HttpStatusCode::OK,
-            expected_latency: Duration::from_secs(1),
-            client: Client::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_method(mut self, method: Method) -> Self {
-        self.method = method;
-        self
-    }
-
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expected_status(mut self, status: HttpStatusCode) -> Self {
-        self.expected_status = status;
-        self
-    }
-
-    #[must_use]
-    pub fn with_expected_latency(mut self, latency: Duration) -> Self {
-        self.expected_latency = latency;
-        self
-    }
-
-    #[must_use]
-    pub fn with_client(mut self, client: Client) -> Self {
-        self.client = client;
-        self
-    }
-}
-
-#[async_trait]
-impl Checker for HttpEndpointChecker {
-    async fn check(&self) -> CheckResult {
-        let started = Instant::now();
-        let response = self
-            .client
-            .request(self.method.clone(), &self.url)
-            .timeout(self.timeout)
-            .send()
-            .await;
-        let elapsed = started.elapsed();
-        let mut result = CheckResult::new(format!("http-{}", self.url), Category::Connectivity)
-            .with_level(Level::Warning)
-            .with_detail("latency_ms", millis(elapsed));
-        result = match response {
-            Err(error) => result.with_status(
-                Status::Down,
-                format!("Failed to connect to {}: {error}", self.url),
-            ),
-            Ok(response) => {
-                let status = response.status();
-                let result = result.with_detail("status_code", status.as_u16());
-                if status != self.expected_status {
-                    result.with_status(
-                        Status::Degraded,
-                        format!(
-                            "Unexpected status code from {}: {} (expected {})",
-                            self.url, status, self.expected_status
-                        ),
-                    )
-                } else if elapsed > self.expected_latency {
-                    result.with_status(
-                        Status::Degraded,
-                        format!("High latency from {}: {}ms", self.url, elapsed.as_millis()),
-                    )
-                } else {
-                    result.with_status(
-                        Status::Up,
-                        format!(
-                            "Successfully connected to {} in {}ms",
-                            self.url,
-                            elapsed.as_millis()
-                        ),
-                    )
-                }
-            }
-        };
-        result.complete()
-    }
-}
-
-/// Maps another subsystem's health report into one dependency check.
-pub struct DependencyChecker {
-    service_name: String,
-    reporter: Arc<dyn Reporter>,
-    level: Level,
-}
-
-impl DependencyChecker {
-    pub fn new(service_name: impl Into<String>, reporter: Arc<dyn Reporter>, level: Level) -> Self {
-        Self {
-            service_name: service_name.into(),
-            reporter,
-            level,
-        }
-    }
-}
-
-#[async_trait]
-impl Checker for DependencyChecker {
-    async fn check(&self) -> CheckResult {
-        let report = self.reporter.report_health().await;
-        let mut result = CheckResult::new(
-            format!("dependency-{}", self.service_name),
-            Category::Dependency,
-        )
-        .with_level(self.level)
-        .with_detail(
-            "dependency_status",
-            format!("{:?}", report.status).to_uppercase(),
-        );
-        let description = match report.status {
-            Status::Up => format!("Dependency {} is healthy", self.service_name),
-            Status::Degraded => format!("Dependency {} is degraded", self.service_name),
-            Status::Down => format!("Dependency {} is down", self.service_name),
-            Status::Unknown => format!("Dependency {} status is unknown", self.service_name),
-        };
-        result = result.with_status(report.status, description);
-        result.complete()
-    }
-}
-
-type DataAccessFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-type DataAccessFn = Arc<dyn Fn() -> DataAccessFuture + Send + Sync>;
-
-/// Checks an asynchronous data-access operation with a fixed timeout.
-pub struct DataAccessChecker {
-    name: String,
-    description: String,
-    timeout: Duration,
-    access: DataAccessFn,
-}
-
-impl DataAccessChecker {
-    pub fn new<F, Fut>(name: impl Into<String>, description: impl Into<String>, access: F) -> Self
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<()>> + Send + 'static,
-    {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            timeout: Duration::from_secs(1),
-            access: Arc::new(move || Box::pin(access())),
-        }
-    }
-
-    #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-}
-
-#[async_trait]
-impl Checker for DataAccessChecker {
-    async fn check(&self) -> CheckResult {
-        let started = Instant::now();
-        let outcome = timeout(self.timeout, (self.access)()).await;
-        let elapsed = started.elapsed();
-        let mut result = CheckResult::new(format!("data-access-{}", self.name), Category::Data)
-            .with_level(Level::Critical)
-            .with_detail("description", self.description.clone())
-            .with_detail("latency_ms", millis(elapsed));
-        result = match outcome {
-            Ok(Ok(())) => result.with_status(
-                Status::Up,
-                format!(
-                    "Data access to {} successful in {}ms",
-                    self.name,
-                    elapsed.as_millis()
-                ),
-            ),
-            Ok(Err(error)) => result.with_status(
-                Status::Down,
-                format!("Data access to {} failed: {error}", self.name),
-            ),
-            Err(_) => result.with_status(
-                Status::Degraded,
-                format!(
-                    "Data access to {} timed out after {}ms",
-                    self.name,
-                    self.timeout.as_millis()
-                ),
-            ),
-        };
-        result.complete()
-    }
-}
-
 /// Runs checks concurrently, contains panics, and applies a batch timeout.
 pub async fn run_checks_parallel(
     checks: Vec<Arc<dyn Checker>>,
@@ -696,7 +400,6 @@ pub struct HealthManager {
     start_time: DateTime<Utc>,
     started_at: Instant,
     checkers: RwLock<Vec<Arc<dyn Checker>>>,
-    reporters: RwLock<Vec<Arc<dyn Reporter>>>,
     services: RwLock<BTreeMap<String, Arc<dyn ServiceHealth>>>,
     cache: RwLock<Option<CachedReport>>,
     refresh_lock: Mutex<()>,
@@ -712,7 +415,6 @@ impl HealthManager {
             start_time: Utc::now(),
             started_at: Instant::now(),
             checkers: RwLock::new(Vec::new()),
-            reporters: RwLock::new(Vec::new()),
             services: RwLock::new(BTreeMap::new()),
             cache: RwLock::new(None),
             refresh_lock: Mutex::new(()),
@@ -723,11 +425,6 @@ impl HealthManager {
 
     pub async fn register_checker(&self, checker: Arc<dyn Checker>) {
         self.checkers.write().await.push(checker);
-        self.invalidate_registration_cache().await;
-    }
-
-    pub async fn register_reporter(&self, reporter: Arc<dyn Reporter>) {
-        self.reporters.write().await.push(reporter);
         self.invalidate_registration_cache().await;
     }
 
@@ -770,29 +467,9 @@ impl HealthManager {
             Arc::new(RuntimeWorkerChecker::default()) as Arc<dyn Checker>,
         ];
         checkers.extend(self.checkers.read().await.clone());
-        let reporters = self.reporters.read().await.clone();
         let services = self.services.read().await.clone();
         let mut tasks = JoinSet::new();
         tasks.spawn(async move { run_checks_parallel(checkers, check_timeout).await });
-        for (index, reporter) in reporters.into_iter().enumerate() {
-            tasks.spawn(async move {
-                match AssertUnwindSafe(reporter.report_health())
-                    .catch_unwind()
-                    .await
-                {
-                    Ok(report) => reporter_results(index, report),
-                    Err(_) => vec![
-                        CheckResult::new(
-                            format!("reporter.{index}.health-task"),
-                            Category::Dependency,
-                        )
-                        .with_level(Level::Critical)
-                        .with_status(Status::Unknown, "Health reporter panicked")
-                        .complete(),
-                    ],
-                }
-            });
-        }
         for (name, service) in services {
             tasks.spawn(async move {
                 let panic_name = format!("service.{name}.health-task");
@@ -897,32 +574,8 @@ impl HealthManager {
     }
 }
 
-fn reporter_results(index: usize, report: Report) -> Vec<CheckResult> {
-    if !report.check_results.is_empty() {
-        return report.check_results;
-    }
-    let name = if report.service_name.is_empty() {
-        format!("reporter.{index}")
-    } else {
-        format!("reporter.{}", report.service_name)
-    };
-    vec![
-        CheckResult::new(name, Category::Dependency)
-            .with_level(Level::Critical)
-            .with_status(
-                report.status,
-                format!("Subsystem health is {:?}", report.status),
-            )
-            .complete(),
-    ]
-}
-
 fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1064,16 +717,9 @@ mod tests {
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
-        routing::get,
     };
-    use tokio::{
-        net::TcpListener,
-        sync::{Notify, oneshot},
-        time::sleep,
-    };
+    use tokio::{sync::Notify, time::sleep};
     use tower::ServiceExt;
-
-    use crate::errors::{AppError, ErrorType};
 
     use super::*;
 
@@ -1270,147 +916,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn connectivity_and_http_checkers_report_real_endpoints() {
-        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let tcp_port = tcp.local_addr().unwrap().port();
-        let accept = tokio::spawn(async move {
-            let _ = tcp.accept().await;
-        });
-        let connectivity = ConnectivityChecker::new("127.0.0.1", tcp_port)
-            .check()
-            .await;
-        assert_eq!(connectivity.status, Status::Up);
-        accept.await.unwrap();
-
-        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = http.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                http,
-                Router::new().route("/ready", get(|| async { StatusCode::CREATED })),
-            )
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await
-            .unwrap();
-        });
-        let check = HttpEndpointChecker::new(format!("http://{address}/ready"))
-            .with_expected_status(HttpStatusCode::CREATED)
-            .check()
-            .await;
-        assert_eq!(check.status, Status::Up);
-        let _ = shutdown_tx.send(());
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn data_access_checker_distinguishes_success_failure_and_timeout() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let success_calls = calls.clone();
-        let success = DataAccessChecker::new("cache", "cache access", move || {
-            let calls = success_calls.clone();
-            async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        })
-        .check()
-        .await;
-        assert_eq!(success.status, Status::Up);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let failure = DataAccessChecker::new("cache", "cache access", || async {
-            Err(AppError::new(ErrorType::Internal, "read failed"))
-        })
-        .check()
-        .await;
-        assert_eq!(failure.status, Status::Down);
-
-        let slow = DataAccessChecker::new("cache", "cache access", || async {
-            sleep(Duration::from_millis(50)).await;
-            Ok(())
-        })
-        .with_timeout(Duration::from_millis(1))
-        .check()
-        .await;
-        assert_eq!(slow.status, Status::Degraded);
-    }
-
-    struct StaticReporter(Status);
-
-    #[async_trait]
-    impl Reporter for StaticReporter {
-        async fn report_health(&self) -> Report {
-            let mut report = Report::new("dependency", Utc::now(), "test");
-            report.status = self.0;
-            report
-        }
-    }
-
-    struct ContributingReporter;
-
-    #[async_trait]
-    impl Reporter for ContributingReporter {
-        async fn report_health(&self) -> Report {
-            let mut report = Report::new("contributor", Utc::now(), "test");
-            report.add_result(
-                CheckResult::new("reported", Category::Dependency)
-                    .with_status(Status::Up, "reported"),
-            );
-            report
-        }
-    }
-
-    #[tokio::test]
-    async fn dependency_checker_maps_report_status_and_manager_uses_reporters() {
-        let checker = DependencyChecker::new(
-            "search",
-            Arc::new(StaticReporter(Status::Down)),
-            Level::Warning,
-        );
-        let result = checker.check().await;
-        assert_eq!(result.status, Status::Down);
-        assert_eq!(result.level, Level::Warning);
-
-        let manager = HealthManager::new(Duration::ZERO, "test");
-        manager
-            .register_reporter(Arc::new(ContributingReporter))
-            .await;
-        assert!(
-            manager
-                .refresh()
-                .await
-                .check_results
-                .iter()
-                .any(|result| result.name == "reported")
-        );
-
-        let manager = HealthManager::new(Duration::ZERO, "test");
-        manager
-            .register_reporter(Arc::new(StaticReporter(Status::Down)))
-            .await;
-        let report = manager.refresh().await;
-        assert_eq!(report.status, Status::Down);
-        assert!(
-            report
-                .check_results
-                .iter()
-                .any(|result| result.name == "reporter.dependency")
-        );
-    }
-
-    struct PanicReporter;
-
-    #[async_trait]
-    impl Reporter for PanicReporter {
-        async fn report_health(&self) -> Report {
-            panic!("reporter panic");
-        }
-    }
-
     struct SlowHealthService;
 
     #[async_trait]
@@ -1430,21 +935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_contains_reporter_panics_and_bounds_service_health() {
-        let panic_manager = HealthManager::new(Duration::ZERO, "test");
-        panic_manager
-            .register_reporter(Arc::new(PanicReporter))
-            .await;
-        let report = panic_manager
-            .refresh_with_timeout(Duration::from_secs(1))
-            .await;
-        assert!(
-            report
-                .check_results
-                .iter()
-                .any(|result| result.name == "reporter.0.health-task")
-        );
-
+    async fn manager_bounds_service_health() {
         let slow_manager = HealthManager::new(Duration::ZERO, "test");
         slow_manager
             .register_service(Arc::new(SlowHealthService))

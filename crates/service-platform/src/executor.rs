@@ -1,11 +1,10 @@
-//! Action executor extension API, registry, templates, and built-in executors.
+//! Action executor extension API, templates, and built-in executors.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::{Client, Method};
 use serde_json::Value;
-use tokio::sync::RwLock;
 
 use crate::{
     errors::{AppError, ErrorType, Result},
@@ -26,39 +25,6 @@ pub trait Executor: Send + Sync {
     }
 
     async fn execute(&self, message: &Message, action: &Action) -> Result<()>;
-}
-
-/// Thread-safe executor registry that rejects duplicate types.
-#[derive(Default)]
-pub struct Registry {
-    executors: RwLock<BTreeMap<String, Arc<dyn Executor>>>,
-}
-
-impl Registry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub async fn register(&self, executor: Arc<dyn Executor>) -> Result<()> {
-        let name = executor.executor_type();
-        if name.is_empty() {
-            return invalid("executor type is empty");
-        }
-        let mut executors = self.executors.write().await;
-        if executors.contains_key(name) {
-            return invalid(format!("executor {name} is registered more than once"));
-        }
-        executors.insert(name.to_owned(), executor);
-        Ok(())
-    }
-
-    pub async fn get(&self, name: &str) -> Option<Arc<dyn Executor>> {
-        self.executors.read().await.get(name).cloned()
-    }
-
-    pub async fn list_types(&self) -> Vec<String> {
-        self.executors.read().await.keys().cloned().collect()
-    }
 }
 
 /// Renders the Go-compatible template subset used by platform configuration.
@@ -306,7 +272,7 @@ fn invalid<T>(message: impl Into<String>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::BTreeMap, time::Duration};
 
     use axum::{
         Router,
@@ -356,29 +322,8 @@ mod tests {
         assert!(render_template("{{index .Metadata severity}}", &message).is_err());
     }
 
-    struct EmptyExecutor;
-
-    #[async_trait]
-    impl Executor for EmptyExecutor {
-        fn executor_type(&self) -> &'static str {
-            ""
-        }
-
-        async fn execute(&self, _message: &Message, _action: &Action) -> Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
-    async fn registry_and_default_executor_lifecycle_cover_lookup_and_validation() {
-        let registry = Registry::new();
-        assert!(registry.get("missing").await.is_none());
-        assert!(registry.register(Arc::new(EmptyExecutor)).await.is_err());
-        registry.register(Arc::new(LogExecutor)).await.unwrap();
-        assert!(registry.register(Arc::new(LogExecutor)).await.is_err());
-        assert_eq!(registry.list_types().await, vec!["log"]);
-        assert!(registry.get("log").await.is_some());
-
+    async fn default_executor_lifecycle_and_log_levels() {
         let executor = LogExecutor;
         executor.start().await.unwrap();
         executor.stop().await.unwrap();

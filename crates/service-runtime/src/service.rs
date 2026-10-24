@@ -1,7 +1,6 @@
 //! Lifecycle-managed input and demonstration services.
 
 use std::{
-    any::Any,
     collections::BTreeMap,
     future::Future,
     pin::Pin,
@@ -18,10 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use service_platform::{
-    config::{
-        BadgeDbAdapterConfig, ConfluenceAdapterConfig, MattermostAdapterConfig,
-        WebSocketInputConfig, format_duration,
-    },
+    config::format_duration,
     errors::{AppError, ErrorType, Result},
     health::{Category, CheckResult, Level, ServiceHealth, Status},
     ruleengine::{DEFAULT_WORKFLOW_NAME, Message},
@@ -39,6 +35,10 @@ use tokio_tungstenite::{
     },
 };
 
+use crate::config::{
+    BadgeDbAdapterConfig, ConfluenceAdapterConfig, MattermostAdapterConfig, WebSocketInputConfig,
+};
+
 pub const WEBSOCKET_INPUT_SERVICE_NAME: &str = "WebSocketInputService";
 pub const BADGEDB_SERVICE_NAME: &str = "BadgeDBService";
 pub const MATTERMOST_SERVICE_NAME: &str = "MattermostService";
@@ -49,7 +49,6 @@ const ERROR_RESPONSE_PREVIEW_LIMIT: usize = 1024;
 pub trait Service: ServiceHealth + Send + Sync {
     fn service_type(&self) -> &str;
     fn workflow(&self) -> &str;
-    fn as_any(&self) -> &dyn Any;
     async fn start(&self) -> Result<()>;
     async fn stop(&self) -> Result<()>;
 
@@ -175,7 +174,7 @@ impl WebSocketService {
     }
 
     pub async fn configure(&self, config: WebSocketInputConfig) -> Result<()> {
-        validate_websocket_config(&config)?;
+        config.validate()?;
         *self.config.write().await = config;
         Ok(())
     }
@@ -195,26 +194,6 @@ impl WebSocketService {
         }
         Ok(())
     }
-}
-
-fn validate_websocket_config(config: &WebSocketInputConfig) -> Result<()> {
-    let url = url::Url::parse(&config.server_url).map_err(|error| {
-        AppError::wrap(
-            ErrorType::InvalidInput,
-            "invalid WebSocket server URL",
-            error,
-        )
-    })?;
-    if !matches!(url.scheme(), "ws" | "wss") || url.host_str().is_none() {
-        return invalid("server URL must be an absolute ws or wss URL");
-    }
-    if !config.path.starts_with('/') {
-        return invalid("path must start with /");
-    }
-    if config.reconnect_interval.is_zero() {
-        return invalid("reconnect interval must be greater than zero");
-    }
-    Ok(())
 }
 
 async fn websocket_loop(
@@ -287,17 +266,13 @@ impl Service for WebSocketService {
         self.base.workflow()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     async fn start(&self) -> Result<()> {
         let _lifecycle = self.base.lifecycle.lock().await;
         if self.base.is_running() {
             return Ok(());
         }
         let config = self.config.read().await.clone();
-        validate_websocket_config(&config)?;
+        config.validate()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(websocket_loop(
             config,
@@ -455,7 +430,7 @@ impl BadgeDbService {
     }
 
     pub async fn configure(&self, config: BadgeDbAdapterConfig) -> Result<()> {
-        validate_badgedb_config(&config)?;
+        config.validate()?;
         *self.config.write().await = config;
         Ok(())
     }
@@ -476,13 +451,6 @@ impl BadgeDbService {
     }
 }
 
-fn validate_badgedb_config(config: &BadgeDbAdapterConfig) -> Result<()> {
-    if config.path.as_os_str().is_empty() {
-        return invalid("database path is required");
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl Service for BadgeDbService {
     fn service_type(&self) -> &str {
@@ -493,15 +461,11 @@ impl Service for BadgeDbService {
         self.base.workflow()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     async fn start(&self) -> Result<()> {
         let _lifecycle = self.base.lifecycle.lock().await;
         {
             let config = self.config.read().await;
-            validate_badgedb_config(&config)?;
+            config.validate()?;
         }
         self.base.set_running(true).await;
         Ok(())
@@ -618,34 +582,24 @@ pub struct ConfluenceSettingsService {
     last_refresh: LastRefresh,
     runtime: Mutex<RefreshRuntime>,
     client: reqwest::Client,
-    cache: CacheDataAccessor,
 }
 
 impl ConfluenceSettingsService {
     pub fn new(config: ConfluenceAdapterConfig, version: impl Into<String>) -> Result<Self> {
-        Self::with_cache(config, version, CacheDataAccessor::default())
-    }
-
-    pub fn with_cache(
-        config: ConfluenceAdapterConfig,
-        version: impl Into<String>,
-        cache: CacheDataAccessor,
-    ) -> Result<Self> {
-        validate_confluence_config(&config)?;
+        config.validate()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|error| {
                 AppError::wrap(ErrorType::Internal, "build Confluence HTTP client", error)
             })?;
-        Ok(Self::with_dependencies(config, version, client, cache))
+        Ok(Self::with_client(config, version, client))
     }
 
-    pub fn with_dependencies(
+    pub fn with_client(
         config: ConfluenceAdapterConfig,
         version: impl Into<String>,
         client: reqwest::Client,
-        cache: CacheDataAccessor,
     ) -> Self {
         Self {
             base: BaseService::new(
@@ -662,7 +616,6 @@ impl ConfluenceSettingsService {
                 task: None,
             }),
             client,
-            cache,
         }
     }
 
@@ -683,44 +636,16 @@ impl ConfluenceSettingsService {
     pub async fn refresh(&self) -> Result<()> {
         let config = self.config.read().await.clone();
         let settings = fetch_confluence_settings(&self.client, &config).await?;
-        let cached = serde_json::to_value(&settings).map_err(|error| {
-            AppError::wrap(
-                ErrorType::Internal,
-                "serialize Confluence settings for cache",
-                error,
-            )
-        })?;
-        *self.settings.write().await = settings.clone();
+        *self.settings.write().await = settings;
         *self.last_refresh.write().await = Some((Utc::now(), Instant::now()));
-        self.cache.set("confluence_settings", cached).await;
         Ok(())
     }
 
     pub async fn configure(&self, config: ConfluenceAdapterConfig) -> Result<()> {
-        validate_confluence_config(&config)?;
+        config.validate()?;
         *self.config.write().await = config;
         Ok(())
     }
-}
-
-fn validate_confluence_config(config: &ConfluenceAdapterConfig) -> Result<()> {
-    let endpoint = url::Url::parse(&config.api_endpoint).map_err(|error| {
-        AppError::wrap(
-            ErrorType::InvalidInput,
-            "invalid Confluence API endpoint",
-            error,
-        )
-    })?;
-    if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
-        return invalid("Confluence API endpoint must be an absolute HTTP or HTTPS URL");
-    }
-    if config.settings_page_id.is_empty() {
-        return invalid("Confluence settings page ID is required");
-    }
-    if config.refresh_interval.is_zero() {
-        return invalid("Confluence refresh interval must be greater than zero");
-    }
-    Ok(())
 }
 
 async fn fetch_confluence_settings(
@@ -775,24 +700,19 @@ impl Service for ConfluenceSettingsService {
         self.base.workflow()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     async fn start(&self) -> Result<()> {
         let _lifecycle = self.base.lifecycle.lock().await;
         if self.base.is_running() {
             return Ok(());
         }
         let config = self.config.read().await.clone();
-        validate_confluence_config(&config)?;
+        config.validate()?;
         if let Err(error) = self.refresh().await {
             tracing::warn!(error = %error, "Failed to fetch initial Confluence settings");
         }
         let client = self.client.clone();
         let settings = self.settings.clone();
         let last_refresh = self.last_refresh.clone();
-        let cache = self.cache.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             loop {
@@ -805,17 +725,10 @@ impl Service for ConfluenceSettingsService {
                     result = fetch_confluence_settings(&client, &config) => result,
                 };
                 match refreshed {
-                    Ok(next) => match serde_json::to_value(&next) {
-                        Ok(cached) => {
-                            *settings.write().await = next;
-                            *last_refresh.write().await = Some((Utc::now(), Instant::now()));
-                            cache.set("confluence_settings", cached).await;
-                        }
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "Failed to serialize Confluence settings"
-                        ),
-                    },
+                    Ok(next) => {
+                        *settings.write().await = next;
+                        *last_refresh.write().await = Some((Utc::now(), Instant::now()));
+                    }
                     Err(error) => {
                         tracing::warn!(error = %error, "Failed to refresh Confluence settings");
                     }
@@ -924,7 +837,7 @@ pub struct MattermostService {
 
 impl MattermostService {
     pub fn new(config: MattermostAdapterConfig, version: impl Into<String>) -> Result<Self> {
-        validate_mattermost_config(&config)?;
+        config.validate()?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -997,7 +910,7 @@ impl MattermostService {
     }
 
     pub async fn configure(&self, config: MattermostAdapterConfig) -> Result<()> {
-        validate_mattermost_config(&config)?;
+        config.validate()?;
         *self.config.write().await = config;
         Ok(())
     }
@@ -1049,38 +962,6 @@ async fn login_mattermost(
                 "Mattermost login response did not include a token",
             )
         })
-}
-
-fn validate_mattermost_config(config: &MattermostAdapterConfig) -> Result<()> {
-    let server = url::Url::parse(&config.server_url).map_err(|error| {
-        AppError::wrap(
-            ErrorType::InvalidInput,
-            "invalid Mattermost server URL",
-            error,
-        )
-    })?;
-    if !matches!(server.scheme(), "http" | "https") || server.host_str().is_none() {
-        return invalid("Mattermost server URL must be an absolute HTTP or HTTPS URL");
-    }
-    if config.channel.is_empty() {
-        return invalid("Mattermost channel is required");
-    }
-    if config.api_token.is_empty() && (config.username.is_empty() || config.password.is_empty()) {
-        return invalid("Mattermost requires an API token or both username and password");
-    }
-    if !config.websocket_url.is_empty() {
-        let websocket = url::Url::parse(&config.websocket_url).map_err(|error| {
-            AppError::wrap(
-                ErrorType::InvalidInput,
-                "invalid Mattermost WebSocket URL",
-                error,
-            )
-        })?;
-        if !matches!(websocket.scheme(), "ws" | "wss") || websocket.host_str().is_none() {
-            return invalid("Mattermost WebSocket URL must be an absolute WS or WSS URL");
-        }
-    }
-    Ok(())
 }
 
 fn mattermost_websocket_endpoint(base: &str) -> String {
@@ -1181,17 +1062,13 @@ impl Service for MattermostService {
         self.base.workflow()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     async fn start(&self) -> Result<()> {
         let _lifecycle = self.base.lifecycle.lock().await;
         if self.base.is_running() {
             return Ok(());
         }
         let config = self.config.read().await.clone();
-        validate_mattermost_config(&config)?;
+        config.validate()?;
         let token = if config.api_token.is_empty() {
             login_mattermost(&self.client, &config).await?
         } else {
@@ -1283,21 +1160,6 @@ impl ServiceHealth for MattermostService {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct CacheDataAccessor {
-    values: Arc<RwLock<BTreeMap<String, Value>>>,
-}
-
-impl CacheDataAccessor {
-    pub async fn get(&self, key: &str) -> Option<Value> {
-        self.values.read().await.get(key).cloned()
-    }
-
-    pub async fn set(&self, key: impl Into<String>, value: Value) {
-        self.values.write().await.insert(key.into(), value);
-    }
-}
-
 async fn join_background_task(
     mut task: JoinHandle<()>,
     wait: Duration,
@@ -1342,12 +1204,12 @@ mod tests {
         },
     };
 
+    use crate::config::RuntimeConfig;
     use axum::{
         Router,
         http::{HeaderValue as AxumHeaderValue, StatusCode as HttpStatus},
         response::IntoResponse,
     };
-    use service_platform::config::RuntimeConfig;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
@@ -1489,14 +1351,13 @@ mod tests {
                 ..default.clone()
             },
         ] {
-            assert!(validate_websocket_config(&config).is_err());
+            assert!(config.validate().is_err());
             config.enabled = false;
         }
 
         let service = WebSocketService::new(default.clone(), "test");
         assert_eq!(service.service_type(), "websocket");
         assert_eq!(service.workflow(), DEFAULT_WORKFLOW_NAME);
-        assert!(service.as_any().is::<WebSocketService>());
         assert!(
             service
                 .process_incoming_message(Message::default())
@@ -1604,7 +1465,6 @@ mod tests {
         let service = BadgeDbService::new(config.clone(), "test");
         assert_eq!(service.service_type(), "badgedb");
         assert_eq!(service.workflow(), DEFAULT_WORKFLOW_NAME);
-        assert!(service.as_any().is::<BadgeDbService>());
         assert!(service.save_badge(badge("before-start")).await.is_err());
         assert!(service.badge("before-start").await.is_err());
         assert_eq!(service.custom_checks().await[0].status, Status::Down);
@@ -1686,19 +1546,15 @@ mod tests {
         let mut config = RuntimeConfig::default().adapters.confluence;
         config.enabled = true;
         config.settings_page_id.clear();
-        let service = ConfluenceSettingsService::with_dependencies(
-            config,
-            "test",
-            reqwest::Client::new(),
-            CacheDataAccessor::default(),
-        );
+        let service =
+            ConfluenceSettingsService::with_client(config, "test", reqwest::Client::new());
 
         assert!(service.start().await.is_err());
         assert!(!service.is_running().await);
     }
 
     #[tokio::test]
-    async fn confluence_validation_fetch_and_cache_cover_success_and_errors() {
+    async fn confluence_validation_and_fetch_cover_success_and_errors() {
         let mut default = RuntimeConfig::default().adapters.confluence;
         default.enabled = true;
         for config in [
@@ -1719,7 +1575,7 @@ mod tests {
                 ..default.clone()
             },
         ] {
-            assert!(validate_confluence_config(&config).is_err());
+            assert!(config.validate().is_err());
             assert!(ConfluenceSettingsService::new(config, "test").is_err());
         }
 
@@ -1744,17 +1600,13 @@ mod tests {
         let page = json!({"body":{"storage":{"value":rules.to_string()}}}).to_string();
         let (base, task) = static_server(HttpStatus::OK, page, None).await;
         default.api_endpoint = base;
-        let cache = CacheDataAccessor::default();
-        let service =
-            ConfluenceSettingsService::with_cache(default.clone(), "test", cache.clone()).unwrap();
+        let service = ConfluenceSettingsService::new(default.clone(), "test").unwrap();
         assert_eq!(service.service_type(), "confluence-settings");
-        assert!(service.as_any().is::<ConfluenceSettingsService>());
         assert!(service.settings().await.is_empty());
         assert_eq!(service.custom_checks().await[0].status, Status::Degraded);
         service.refresh().await.unwrap();
         assert_eq!(service.settings().await.len(), 2);
         assert_eq!(service.match_event("DEPLOY").await.len(), 1);
-        assert!(cache.get("confluence_settings").await.is_some());
         assert_eq!(service.custom_checks().await[0].status, Status::Up);
         assert_eq!(service.metrics().await["settings_count"], 2);
 
@@ -1904,7 +1756,7 @@ mod tests {
                 ..default.clone()
             },
         ] {
-            assert!(validate_mattermost_config(&config).is_err());
+            assert!(config.validate().is_err());
             assert!(MattermostService::new(config, "test").is_err());
         }
         assert_eq!(
@@ -1934,7 +1786,6 @@ mod tests {
         );
         let service = MattermostService::new(default.clone(), "test").unwrap();
         assert_eq!(service.service_type(), "mattermost");
-        assert!(service.as_any().is::<MattermostService>());
         assert!(service.send_message("before").await.is_err());
         service.start().await.unwrap();
         service.start().await.unwrap();
@@ -2041,13 +1892,5 @@ mod tests {
         )
         .await;
         assert!(!runtime.lock().await.websocket_connected);
-    }
-
-    #[tokio::test]
-    async fn cache_data_accessor_returns_cloned_values() {
-        let cache = CacheDataAccessor::default();
-        assert!(cache.get("missing").await.is_none());
-        cache.set("key", json!({"value": 1})).await;
-        assert_eq!(cache.get("key").await, Some(json!({"value": 1})));
     }
 }

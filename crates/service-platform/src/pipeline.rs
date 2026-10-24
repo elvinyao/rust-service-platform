@@ -15,7 +15,7 @@ use tokio::{
 
 use crate::{
     errors::{AppError, ErrorType, Result},
-    executor::{Executor, Registry},
+    executor::Executor,
     ruleengine::{
         Composer, ComposerSnapshot, EngineConfig, ExecutionPlan, Message, RuleProvider,
         validate_provider_rule_set,
@@ -87,13 +87,13 @@ pub struct Engine {
     config: EngineConfig,
     composer: Composer,
     providers: BTreeMap<String, Arc<dyn RuleProvider>>,
-    registry: Arc<Registry>,
     executors: BTreeMap<String, Arc<dyn Executor>>,
     state: Mutex<EngineState>,
     process_gate: RwLock<()>,
 }
 
 impl Engine {
+    #[allow(clippy::unused_async)]
     pub async fn new(
         config: EngineConfig,
         providers: Vec<Arc<dyn RuleProvider>>,
@@ -115,19 +115,21 @@ impl Engine {
         }
         validate_configured_providers(&config, &provider_map)?;
 
-        let registry = Arc::new(Registry::new());
         let mut executor_map = BTreeMap::new();
         for executor in executors {
             let name = executor.executor_type().to_owned();
-            registry.register(executor.clone()).await?;
-            executor_map.insert(name, executor);
+            if name.is_empty() {
+                return invalid("executor type is empty");
+            }
+            if executor_map.insert(name.clone(), executor).is_some() {
+                return invalid(format!("executor {name} is registered more than once"));
+            }
         }
         let composer = Composer::new(config.clone(), provider_map.clone());
         Ok(Self {
             config,
             composer,
             providers: provider_map,
-            registry,
             executors: executor_map,
             state: Mutex::new(EngineState::default()),
             process_gate: RwLock::new(()),
@@ -286,7 +288,7 @@ impl Engine {
             .await?;
         let mut failures = Vec::new();
         for action in &plan.actions {
-            let Some(executor) = self.registry.get(&action.executor).await else {
+            let Some(executor) = self.executors.get(&action.executor) else {
                 failures.push(ActionFailure {
                     action_id: action.id.clone(),
                     executor: action.executor.clone(),
@@ -308,7 +310,7 @@ impl Engine {
     pub async fn snapshot(&self) -> EngineSnapshot {
         EngineSnapshot {
             composer: self.composer.snapshot().await,
-            executors: self.registry.list_types().await,
+            executors: self.executors.keys().cloned().collect(),
         }
     }
 
@@ -330,7 +332,7 @@ impl Engine {
             )?;
             for rule in snapshot.rules.iter().filter(|rule| rule.enabled) {
                 for action in &rule.actions {
-                    if self.registry.get(&action.executor).await.is_none() {
+                    if !self.executors.contains_key(&action.executor) {
                         return invalid(format!(
                             "provider {provider_name} rule {} references unregistered executor {}",
                             rule.id, action.executor

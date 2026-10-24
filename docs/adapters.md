@@ -4,7 +4,7 @@ The reusable SDK does not depend on Mattermost, Confluence, BadgeDB, or the fake
 
 ## Runtime Wiring
 
-`container::Container` owns one runtime configuration, shared cache, `HealthManager`, and `ServiceManager`. It registers only enabled services.
+`app::App` constructs `HealthManager` and `ServiceManager`, registers only enabled services, and passes `AdapterServices` directly into `workflow::WorkflowEngine`.
 
 `workflow::WorkflowEngine` always registers:
 
@@ -225,8 +225,8 @@ cargo run -p fake-server --bin fake-server -- \
 4. Make `start` and `stop` idempotent.
 5. Decode transport payloads into `ruleengine::Message`.
 6. expose an async handler registration API.
-7. Register the service conditionally in `Container`.
-8. Connect its handler to `WorkflowManager`.
+7. Register the service conditionally in `App::start`.
+8. Connect its handler to `WorkflowEngine::process_message`.
 9. Add disconnect, reconnect, malformed-payload, shutdown, and health tests.
 
 Transport concerns belong in the adapter. Rules should not know whether a message came from HTTP, WebSocket, a queue, or a file.
@@ -244,11 +244,9 @@ Transport concerns belong in the adapter. Rules should not know whether a messag
 ## Adding a Service-Backed Executor
 
 1. Implement `Executor`.
-2. look up the service by stable name.
-3. downcast and validate the expected service type.
-4. validate action parameters.
-5. call a bounded service method.
-6. return dependency errors to the pipeline.
-7. register the executor only when its service is enabled.
-
-For general framework consumers, prefer constructor injection directly into the executor over runtime service lookup. The lookup pattern exists to demonstrate the reference application's DI boundary.
+2. Inject `Arc<MyService>` directly into the executor constructor.
+3. Verify the service is running before executing actions.
+4. Validate action parameters.
+5. Call a bounded service method.
+6. Return dependency errors to the pipeline.
+7. Register the executor only when its service is enabled.

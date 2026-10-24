@@ -337,16 +337,6 @@ Assert:
 
 Never call an external network service from a unit test.
 
-## Run Independent Work With a Limit
-
-```rust
-let pool = WorkerPool::new(8)?;
-let token = CancellationToken::new();
-let results = pool.run_cancellable(&token, tasks).await?;
-```
-
-Cancellation prevents pending tasks from starting but does not forcibly abort active work.
-
 ## Separate Local and Deployment Configuration
 
 Keep complete explicit profiles:

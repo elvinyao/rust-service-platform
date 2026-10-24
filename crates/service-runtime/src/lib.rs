@@ -3,7 +3,7 @@
 pub mod adapters;
 pub mod app;
 pub mod cli;
-pub mod container;
+pub mod config;
 pub mod manager;
 pub mod service;
 pub mod workflow;

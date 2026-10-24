@@ -8,9 +8,9 @@ The product boundary is generic. WebSocket, Confluence-like, Mattermost-like, an
 
 ## Goals
 
-- provide stable reusable APIs for rule matching, composition, execution, health, logging, configuration, context, and bounded concurrency
+- provide stable reusable APIs for rule matching, composition, execution, health, logging, and configuration
 - keep rule behavior primarily data-driven through strict YAML
-- make extension points explicit through Rust traits and dependency injection
+- make extension points explicit through Rust traits and constructor injection
 - provide fail-fast startup, rollback, bounded shutdown, and restartable lifecycle
 - keep optional business integrations outside the public SDK
 - support one-command local and container development
@@ -34,9 +34,7 @@ The product boundary is generic. WebSocket, Confluence-like, Mattermost-like, an
 crates/
   service-platform/
     src/
-      concurrency.rs
       config.rs
-      context.rs
       errors.rs
       executor.rs
       health.rs
@@ -50,7 +48,7 @@ crates/
       adapters.rs
       app.rs
       cli.rs
-      container.rs
+      config.rs
       manager.rs
       service.rs
       workflow.rs
@@ -145,7 +143,6 @@ Executor types are non-empty and unique.
 ### Health Traits
 
 - `Checker`: produces one `CheckResult`
-- `Reporter`: produces a subsystem `Report`
 - `ServiceHealth`: running state, metrics, and custom checks
 
 All trait objects are `Send + Sync`.
@@ -293,7 +290,7 @@ Secrets should be environment- or secret-manager-owned. Demo credentials are loc
 Startup order:
 
 1. configuration
-2. container and service registration
+2. service registration
 3. services
 4. service monitor
 5. workflow engine
@@ -307,7 +304,7 @@ Shutdown order:
 1. mark health shutting down
 2. stop service monitor
 3. stop admin server
-4. stop workflows/pipeline
+4. stop workflow engine/pipeline
 5. stop services
 6. release owned wiring
 
@@ -316,19 +313,9 @@ Failed workflow or service cleanup remains owned so a later shutdown call can re
 Monitor, workflow, and service shutdown waits are bounded; a monitor task that exceeds its
 deadline is aborted and joined.
 
-## Dependency Injection
+## Dependency Wiring
 
-`Container` owns one lifecycle's singletons:
-
-- version
-- cloned runtime configuration
-- shared cache
-- health manager
-- service manager
-
-It creates only enabled services and exposes service lookup by stable name.
-
-Framework consumers should prefer constructor injection. Service lookup/downcast is limited to the reference runtime pattern.
+`App` constructs enabled services directly and passes their `Arc` handles into `ServiceManager` and `WorkflowEngine` (`AdapterServices`). Framework consumers and reference adapters both use direct constructor injection.
 
 ## Service Management
 
@@ -342,17 +329,7 @@ Framework consumers should prefer constructor injection. Service lookup/downcast
 - bounds rollback operations
 - stops all services concurrently
 - aggregates deterministic sorted failures
-- filters by workflow and type
 - monitors/restarts down services on a delayed interval
-
-`WorkflowManager`:
-
-- rejects empty and duplicate workflows
-- dispatches in sorted order
-- stops after the first successful workflow
-- reports no workflows and all-failed conditions
-- stops workflows in reverse sorted order
-- aggregates stop failures
 
 ## Admin HTTP
 
@@ -382,7 +359,6 @@ Health combines:
 
 - built-in memory and Tokio runtime checks
 - registered checkers
-- registered reporters
 - service running state
 - service custom checks
 
@@ -398,7 +374,7 @@ Overall status:
 
 Reports are cached for the configured refresh interval and cloned before return.
 
-## Logging and Context
+## Logging
 
 Logging uses `tracing` and `tracing-subscriber`.
 
@@ -411,23 +387,8 @@ Requirements:
 - optional ANSI
 - stdout, stderr, or rotating file destination
 - close-before-rename cross-platform rotation
-- request, trace, correlation, user, service, and operation fields
 
 The global subscriber initializes at most once.
-
-## Bounded Concurrency
-
-`WorkerPool`:
-
-- requires positive worker count
-- starts at most N tasks
-- returns successful values in input order
-- orders task errors by input position
-- stops scheduling pending tasks after cancellation
-- allows active tasks to complete
-- reports pre-cancellation distinctly
-
-It is batch-oriented, not a streaming worker service.
 
 ## Demo Adapters
 
@@ -496,10 +457,9 @@ Required evidence:
 - model and validation unit tests
 - all composition modes
 - YAML strictness
-- registry and template tests
+- template rendering tests
 - HTTP executor method/header/body/status/timeout tests
 - pipeline lifecycle, rollback, in-flight, and partial failure tests
-- worker ordering/cancellation tests
 - health status, timeout, panic, endpoint, and cache tests
 - service manager start/rollback/stop/monitor tests
 - adapter HTTP/WebSocket integration tests

@@ -1291,7 +1291,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -1314,7 +1313,6 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tracing",
- "url",
  "uuid",
 ]
 

@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use service_platform::{
     errors::{AppError, ErrorType, Result},
     executor::{Executor, render_template},
+    health::ServiceHealth,
     ruleengine::{
         Action, Condition, ConditionOperator, Message, Rule, RuleProvider, RuleSet,
         validate_rule_set,
@@ -16,18 +17,12 @@ use service_platform::{
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{
-    manager::ServiceManager,
-    service::{
-        BADGEDB_SERVICE_NAME, Badge, BadgeDbService, CONFLUENCE_SETTINGS_SERVICE_NAME,
-        ConfluenceSettingsService, MATTERMOST_SERVICE_NAME, MattermostService,
-    },
-};
+use crate::service::{Badge, BadgeDbService, ConfluenceSettingsService, MattermostService};
 
 pub struct ConfluenceProvider {
     name: String,
     workflow: String,
-    services: Arc<ServiceManager>,
+    settings: Arc<ConfluenceSettingsService>,
     last_good: RwLock<RuleSet>,
 }
 
@@ -35,38 +30,19 @@ impl ConfluenceProvider {
     pub fn new(
         name: impl Into<String>,
         workflow: impl Into<String>,
-        services: Arc<ServiceManager>,
+        settings: Arc<ConfluenceSettingsService>,
     ) -> Self {
         let name = name.into();
         Self {
             last_good: RwLock::new(RuleSet::empty(name.clone())),
             name,
             workflow: workflow.into(),
-            services,
+            settings,
         }
     }
 
     async fn current_snapshot(&self) -> Result<RuleSet> {
-        let service = self
-            .services
-            .get(CONFLUENCE_SETTINGS_SERVICE_NAME)
-            .await
-            .ok_or_else(|| {
-                AppError::new(
-                    ErrorType::NotFound,
-                    "service ConfluenceSettingsService not found",
-                )
-            })?;
-        let settings_service = service
-            .as_any()
-            .downcast_ref::<ConfluenceSettingsService>()
-            .ok_or_else(|| {
-                AppError::new(
-                    ErrorType::Internal,
-                    "service ConfluenceSettingsService type mismatch",
-                )
-            })?;
-        if !service.is_running().await {
+        if !self.settings.is_running().await {
             return Err(AppError::new(
                 ErrorType::ServiceUnavailable,
                 "service ConfluenceSettingsService is not running",
@@ -74,7 +50,7 @@ impl ConfluenceProvider {
         }
 
         let mut rules = Vec::new();
-        for (index, setting) in settings_service.settings().await.into_iter().enumerate() {
+        for (index, setting) in self.settings.settings().await.into_iter().enumerate() {
             let mut conditions = vec![Condition {
                 field: "type".to_owned(),
                 op: ConditionOperator::Eq,
@@ -145,12 +121,12 @@ impl RuleProvider for ConfluenceProvider {
 }
 
 pub struct MattermostExecutor {
-    services: Arc<ServiceManager>,
+    mattermost: Arc<MattermostService>,
 }
 
 impl MattermostExecutor {
-    pub fn new(services: Arc<ServiceManager>) -> Self {
-        Self { services }
+    pub fn new(mattermost: Arc<MattermostService>) -> Self {
+        Self { mattermost }
     }
 }
 
@@ -161,15 +137,6 @@ impl Executor for MattermostExecutor {
     }
 
     async fn execute(&self, message: &Message, action: &Action) -> Result<()> {
-        let service = self
-            .services
-            .get(MATTERMOST_SERVICE_NAME)
-            .await
-            .ok_or_else(|| AppError::new(ErrorType::NotFound, "MattermostService not found"))?;
-        let mattermost = service
-            .as_any()
-            .downcast_ref::<MattermostService>()
-            .ok_or_else(|| AppError::new(ErrorType::Internal, "MattermostService type mismatch"))?;
         let template = action
             .params
             .get("template")
@@ -186,20 +153,22 @@ impl Executor for MattermostExecutor {
         }
         match action.params.get("channel_id").and_then(Value::as_str) {
             Some(channel) if !channel.is_empty() => {
-                mattermost.send_message_to_channel(channel, &output).await
+                self.mattermost
+                    .send_message_to_channel(channel, &output)
+                    .await
             }
-            _ => mattermost.send_message(&output).await,
+            _ => self.mattermost.send_message(&output).await,
         }
     }
 }
 
 pub struct BadgeDbExecutor {
-    services: Arc<ServiceManager>,
+    database: Arc<BadgeDbService>,
 }
 
 impl BadgeDbExecutor {
-    pub fn new(services: Arc<ServiceManager>) -> Self {
-        Self { services }
+    pub fn new(database: Arc<BadgeDbService>) -> Self {
+        Self { database }
     }
 }
 
@@ -210,15 +179,6 @@ impl Executor for BadgeDbExecutor {
     }
 
     async fn execute(&self, message: &Message, action: &Action) -> Result<()> {
-        let service = self
-            .services
-            .get(BADGEDB_SERVICE_NAME)
-            .await
-            .ok_or_else(|| AppError::new(ErrorType::NotFound, "BadgeDBService not found"))?;
-        let database = service
-            .as_any()
-            .downcast_ref::<BadgeDbService>()
-            .ok_or_else(|| AppError::new(ErrorType::Internal, "BadgeDBService type mismatch"))?;
         let string_param = |name: &str, fallback: &str| {
             action
                 .params
@@ -242,80 +202,17 @@ impl Executor for BadgeDbExecutor {
             revoked: false,
             revoked_at: None,
         };
-        database.save_badge(badge).await
+        self.database.save_badge(badge).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        any::Any,
-        sync::atomic::{AtomicBool, Ordering},
-        time::Duration,
-    };
+    use service_platform::ruleengine::DEFAULT_WORKFLOW_NAME;
 
-    use service_platform::{
-        config::RuntimeConfig,
-        health::{CheckResult, HealthManager, ServiceHealth},
-        ruleengine::DEFAULT_WORKFLOW_NAME,
-    };
-
-    use crate::service::{Service, WebSocketService};
+    use crate::{config::RuntimeConfig, service::Service};
 
     use super::*;
-
-    struct NamedService {
-        name: &'static str,
-        running: AtomicBool,
-    }
-
-    #[async_trait]
-    impl ServiceHealth for NamedService {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        async fn is_running(&self) -> bool {
-            self.running.load(Ordering::SeqCst)
-        }
-
-        async fn metrics(&self) -> BTreeMap<String, Value> {
-            BTreeMap::new()
-        }
-
-        async fn custom_checks(&self) -> Vec<CheckResult> {
-            Vec::new()
-        }
-    }
-
-    #[async_trait]
-    impl Service for NamedService {
-        fn service_type(&self) -> &'static str {
-            "wrong"
-        }
-
-        fn workflow(&self) -> &str {
-            DEFAULT_WORKFLOW_NAME
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        async fn start(&self) -> Result<()> {
-            self.running.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn stop(&self) -> Result<()> {
-            self.running.store(false, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    fn manager() -> Arc<ServiceManager> {
-        ServiceManager::new("test", HealthManager::new(Duration::from_secs(30), "test"))
-    }
 
     fn message() -> Message {
         Message {
@@ -337,107 +234,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapters_report_missing_services_and_provider_keeps_last_snapshot() {
-        let services = manager();
-        let provider =
-            ConfluenceProvider::new("confluence", DEFAULT_WORKFLOW_NAME, services.clone());
-        assert_eq!(provider.name(), "confluence");
-        assert_eq!(
-            provider.start().await.unwrap_err().error_type,
-            ErrorType::NotFound
-        );
-        let snapshot = provider.snapshot().await;
-        assert_eq!(snapshot.source, "confluence");
-        assert!(snapshot.rules.is_empty());
-        assert!(snapshot.last_error.contains("not found"));
-
-        let mattermost = MattermostExecutor::new(services.clone());
-        assert_eq!(mattermost.executor_type(), "mattermost");
-        assert_eq!(
-            mattermost
-                .execute(&message(), &action("mattermost"))
-                .await
-                .unwrap_err()
-                .error_type,
-            ErrorType::NotFound
-        );
-
-        let database = BadgeDbExecutor::new(services);
-        assert_eq!(database.executor_type(), "db");
-        assert_eq!(
-            database
-                .execute(&message(), &action("db"))
-                .await
-                .unwrap_err()
-                .error_type,
-            ErrorType::NotFound
-        );
-    }
-
-    #[tokio::test]
-    async fn adapters_reject_services_registered_under_the_wrong_concrete_type() {
-        let services = manager();
-        for name in [
-            CONFLUENCE_SETTINGS_SERVICE_NAME,
-            MATTERMOST_SERVICE_NAME,
-            BADGEDB_SERVICE_NAME,
-        ] {
-            services
-                .register(Arc::new(NamedService {
-                    name,
-                    running: AtomicBool::new(true),
-                }))
-                .await
-                .unwrap();
-        }
-
-        let provider =
-            ConfluenceProvider::new("confluence", DEFAULT_WORKFLOW_NAME, services.clone());
-        assert_eq!(
-            provider.start().await.unwrap_err().error_type,
-            ErrorType::Internal
-        );
-        assert_eq!(
-            MattermostExecutor::new(services.clone())
-                .execute(&message(), &action("mattermost"))
-                .await
-                .unwrap_err()
-                .error_type,
-            ErrorType::Internal
-        );
-        assert_eq!(
-            BadgeDbExecutor::new(services)
-                .execute(&message(), &action("db"))
-                .await
-                .unwrap_err()
-                .error_type,
-            ErrorType::Internal
-        );
-    }
-
-    #[tokio::test]
-    async fn confluence_provider_rejects_a_stopped_settings_service() {
-        let services = manager();
+    async fn confluence_provider_rejects_stopped_service_and_keeps_last_snapshot() {
         let settings = Arc::new(
             ConfluenceSettingsService::new(RuntimeConfig::default().adapters.confluence, "test")
                 .unwrap(),
         );
-        services.register(settings).await.unwrap();
-        let provider = ConfluenceProvider::new("confluence", DEFAULT_WORKFLOW_NAME, services);
+        let provider = ConfluenceProvider::new("confluence", DEFAULT_WORKFLOW_NAME, settings);
+        assert_eq!(provider.name(), "confluence");
         assert_eq!(
             provider.start().await.unwrap_err().error_type,
             ErrorType::ServiceUnavailable
         );
+        let snapshot = provider.snapshot().await;
+        assert_eq!(snapshot.source, "confluence");
+        assert!(snapshot.rules.is_empty());
+        assert!(snapshot.last_error.contains("not running"));
     }
 
     #[tokio::test]
     async fn mattermost_executor_validates_templates_before_sending() {
-        let services = manager();
         let mattermost = Arc::new(
             MattermostService::new(RuntimeConfig::default().adapters.mattermost, "test").unwrap(),
         );
-        services.register(mattermost).await.unwrap();
-        let executor = MattermostExecutor::new(services);
+        let executor = MattermostExecutor::new(mattermost);
+        assert_eq!(executor.executor_type(), "mattermost");
 
         let mut invalid = action("mattermost");
         invalid
@@ -476,14 +296,13 @@ mod tests {
 
     #[tokio::test]
     async fn badgedb_executor_applies_custom_and_default_badge_fields() {
-        let services = manager();
         let database = Arc::new(BadgeDbService::new(
             RuntimeConfig::default().adapters.badgedb,
             "test",
         ));
         database.start().await.unwrap();
-        services.register(database.clone()).await.unwrap();
-        let executor = BadgeDbExecutor::new(services);
+        let executor = BadgeDbExecutor::new(database.clone());
+        assert_eq!(executor.executor_type(), "db");
 
         let mut custom = action("db");
         custom.params.insert("name".to_owned(), json!("release"));
@@ -500,24 +319,5 @@ mod tests {
         executor.execute(&message(), &defaults).await.unwrap();
         assert_eq!(database.metrics().await["db_entries"], 2);
         database.stop().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn wrong_service_fixture_implements_full_service_contract() {
-        let service = NamedService {
-            name: "fixture",
-            running: AtomicBool::new(false),
-        };
-        assert_eq!(service.service_type(), "wrong");
-        assert_eq!(service.workflow(), DEFAULT_WORKFLOW_NAME);
-        assert!(service.as_any().is::<NamedService>());
-        service.start().await.unwrap();
-        assert!(service.is_running().await);
-        service.stop().await.unwrap();
-        assert!(!service.is_running().await);
-
-        let websocket =
-            WebSocketService::new(RuntimeConfig::default().inputs.websocket, "test-version");
-        assert!(websocket.as_any().is::<WebSocketService>());
     }
 }

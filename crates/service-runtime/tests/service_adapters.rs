@@ -1,12 +1,10 @@
 use std::time::Duration;
 
 use fake_server::{FakeApiManager, Ports};
-use service_platform::{
+use service_platform::health::{ServiceHealth, Status};
+use service_runtime::{
     config::RuntimeConfig,
-    health::{ServiceHealth, Status},
-};
-use service_runtime::service::{
-    CacheDataAccessor, ConfluenceSettingsService, MattermostService, Service, WebSocketService,
+    service::{ConfluenceSettingsService, MattermostService, Service, WebSocketService},
 };
 use tokio::time::{sleep, timeout};
 
@@ -47,21 +45,18 @@ async fn mattermost_logs_in_when_token_is_absent_and_posts_with_returned_token()
 }
 
 #[tokio::test]
-async fn confluence_fetches_settings_populates_shared_cache_and_validates_reconfigure() {
+async fn confluence_fetches_settings_and_validates_reconfigure() {
     let fake = FakeApiManager::new(ephemeral_ports());
     let ports = fake.start().await.unwrap();
     let mut config = RuntimeConfig::default().adapters.confluence;
     config.enabled = true;
     config.api_endpoint = format!("http://127.0.0.1:{}", ports.confluence);
     config.refresh_interval = Duration::from_millis(20);
-    let cache = CacheDataAccessor::default();
-    let service =
-        ConfluenceSettingsService::with_cache(config.clone(), "test", cache.clone()).unwrap();
+    let service = ConfluenceSettingsService::new(config.clone(), "test").unwrap();
 
     service.start().await.unwrap();
 
     assert!(!service.settings().await.is_empty());
-    assert!(cache.get("confluence_settings").await.is_some());
     assert_eq!(service.custom_checks().await[0].status, Status::Up);
 
     config.settings_page_id.clear();

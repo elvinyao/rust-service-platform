@@ -25,7 +25,6 @@ Use this page to choose the shortest useful path through the project.
 - [Architecture and Design](design.md)
 - [Rule Engine](rule-engine.md)
 - [Executors](executors.md)
-- [Bounded Concurrency](concurrency.md)
 - [Reference Adapters](adapters.md)
 
 ### Runtime Maintainer
@@ -45,7 +44,6 @@ Use this page to choose the shortest useful path through the project.
 | [Configuration](configuration.md) | YAML schema, profiles, environment variables, validation |
 | [Rule Engine](rule-engine.md) | Models, matching, providers, composition, plans |
 | [Executors](executors.md) | Executor trait, templates, built-ins, partial failures |
-| [Bounded Concurrency](concurrency.md) | Worker limits, ordering, cancellation |
 | [Reference Adapters](adapters.md) | WebSocket, Confluence-like, Mattermost-like, BadgeDB |
 | [Framework Cookbook](cookbook.md) | Task-oriented recipes |
 | [Runnable Examples](../examples/README.md) | Commands and payloads for all examples |

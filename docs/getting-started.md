@@ -217,7 +217,6 @@ The message path is:
 ```text
 fake WebSocket broadcast
 -> WebSocketService
--> WorkflowManager
 -> WorkflowEngine
 -> pipeline::Engine
 -> Composer
@@ -261,8 +260,8 @@ Reference runtime:
 
 1. `crates/service-runtime/src/main.rs`
 2. `crates/service-runtime/src/cli.rs`
-3. `crates/service-runtime/src/app.rs`
-4. `crates/service-runtime/src/container.rs`
+3. `crates/service-runtime/src/config.rs`
+4. `crates/service-runtime/src/app.rs`
 5. `crates/service-runtime/src/service.rs`
 6. `crates/service-runtime/src/manager.rs`
 7. `crates/service-runtime/src/workflow.rs`
@@ -274,7 +273,6 @@ Useful CodeLLDB breakpoints:
 
 - `service_runtime::app::App::start`
 - `service_runtime::service::websocket_loop`
-- `service_runtime::manager::WorkflowManager::dispatch`
 - `service_runtime::workflow::WorkflowEngine::process_message`
 - `service_platform::ruleengine::Composer::build_execution_plan`
 - `service_platform::pipeline::Engine::process_outcome`

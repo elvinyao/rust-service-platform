@@ -2,10 +2,8 @@
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use async_trait::async_trait;
 use serde::Serialize;
 use service_platform::{
-    config::RuntimeConfig,
     errors::{AppError, ErrorType, Result},
     executor::{Executor, HttpExecutor, LogExecutor},
     pipeline::{Engine, EngineSnapshot},
@@ -14,8 +12,16 @@ use service_platform::{
 
 use crate::{
     adapters::{BadgeDbExecutor, ConfluenceProvider, MattermostExecutor},
-    manager::{ServiceManager, Workflow},
+    config::RuntimeConfig,
+    service::{BadgeDbService, ConfluenceSettingsService, MattermostService},
 };
+
+#[derive(Default)]
+pub struct AdapterServices {
+    pub confluence: Option<Arc<ConfluenceSettingsService>>,
+    pub badgedb: Option<Arc<BadgeDbService>>,
+    pub mattermost: Option<Arc<MattermostService>>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EngineAdminSnapshot {
@@ -31,7 +37,7 @@ pub struct WorkflowEngine {
 
 impl WorkflowEngine {
     pub async fn new(
-        services: Arc<ServiceManager>,
+        adapters: AdapterServices,
         config_path: impl AsRef<Path>,
         rules_path: impl AsRef<Path>,
         runtime: &RuntimeConfig,
@@ -45,21 +51,24 @@ impl WorkflowEngine {
             rules_path.as_ref(),
             DEFAULT_WORKFLOW_NAME,
         ))];
-        if runtime.adapters.confluence.enabled && engine_uses_provider(&config, "confluence") {
+        if let Some(confluence) = adapters
+            .confluence
+            .filter(|_| engine_uses_provider(&config, "confluence"))
+        {
             providers.push(Arc::new(ConfluenceProvider::new(
                 "confluence",
                 DEFAULT_WORKFLOW_NAME,
-                services.clone(),
+                confluence,
             )));
         }
 
         let mut executors: Vec<Arc<dyn Executor>> =
             vec![Arc::new(LogExecutor), Arc::new(HttpExecutor::new())];
-        if runtime.adapters.badgedb.enabled {
-            executors.push(Arc::new(BadgeDbExecutor::new(services.clone())));
+        if let Some(badgedb) = adapters.badgedb {
+            executors.push(Arc::new(BadgeDbExecutor::new(badgedb)));
         }
-        if runtime.adapters.mattermost.enabled {
-            executors.push(Arc::new(MattermostExecutor::new(services)));
+        if let Some(mattermost) = adapters.mattermost {
+            executors.push(Arc::new(MattermostExecutor::new(mattermost)));
         }
 
         let engine = Arc::new(Engine::new(config, providers, executors).await?);
@@ -70,11 +79,56 @@ impl WorkflowEngine {
         }))
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub async fn admin_snapshot(&self) -> EngineAdminSnapshot {
         EngineAdminSnapshot {
             name: self.name.clone(),
             engine: self.engine.snapshot().await,
         }
+    }
+
+    pub async fn process_message(&self, message: &Message) -> Result<()> {
+        let outcome = self.engine.process_outcome(&self.name, message).await?;
+        if outcome.plan.actions.is_empty() {
+            tracing::debug!(
+                message_type = %message.kind,
+                message_id = %message.id,
+                "No matching rules"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            workflow = %self.name,
+            rules = outcome.plan.rules.len(),
+            actions = outcome.plan.actions.len(),
+            "Workflow matched rules and actions"
+        );
+        if outcome.failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::new(
+                ErrorType::PartialFailure,
+                format!(
+                    "workflow execution had partial failures: {}",
+                    outcome
+                        .failures
+                        .iter()
+                        .map(|failure| format!(
+                            "action={} executor={}: {}",
+                            failure.action_id, failure.executor, failure.error
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            ))
+        }
+    }
+
+    pub async fn stop(&self) -> Result<()> {
+        self.engine.stop().await
     }
 }
 
@@ -121,67 +175,15 @@ fn engine_uses_provider(config: &EngineConfig, provider: &str) -> bool {
         .any(|workflow| workflow.providers.iter().any(|name| name == provider))
 }
 
-#[async_trait]
-impl Workflow for WorkflowEngine {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    async fn process_message(&self, message: &Message) -> Result<()> {
-        let outcome = self.engine.process_outcome(&self.name, message).await?;
-        if outcome.plan.actions.is_empty() {
-            tracing::debug!(
-                message_type = %message.kind,
-                message_id = %message.id,
-                "No matching rules"
-            );
-            return Ok(());
-        }
-        tracing::info!(
-            workflow = %self.name,
-            rules = outcome.plan.rules.len(),
-            actions = outcome.plan.actions.len(),
-            "Workflow matched rules and actions"
-        );
-        if outcome.failures.is_empty() {
-            Ok(())
-        } else {
-            Err(AppError::new(
-                ErrorType::PartialFailure,
-                format!(
-                    "workflow execution had partial failures: {}",
-                    outcome
-                        .failures
-                        .iter()
-                        .map(|failure| format!(
-                            "action={} executor={}: {}",
-                            failure.action_id, failure.executor, failure.error
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-            ))
-        }
-    }
-
-    async fn stop(&self) -> Result<()> {
-        self.engine.stop().await
-    }
-}
-
 fn invalid<T>(message: impl Into<String>) -> Result<T> {
     Err(AppError::new(ErrorType::InvalidInput, message))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::fs;
 
-    use service_platform::{
-        config::RuntimeConfig,
-        health::HealthManager,
-        ruleengine::{CompositionMode, DEFAULT_WORKFLOW_NAME},
-    };
+    use service_platform::ruleengine::{CompositionMode, DEFAULT_WORKFLOW_NAME};
 
     use super::*;
 
@@ -189,9 +191,8 @@ mod tests {
     async fn default_workflow_uses_yaml_and_core_executors() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let runtime = RuntimeConfig::default();
-        let services = ServiceManager::new("test", HealthManager::new(Duration::default(), "test"));
         let workflow = WorkflowEngine::new(
-            services,
+            AdapterServices::default(),
             root.join("config/rule-engine.yaml"),
             root.join("config/workflow-rules.yaml"),
             &runtime,

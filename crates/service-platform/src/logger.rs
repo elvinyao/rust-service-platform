@@ -1,4 +1,4 @@
-//! Structured logging configuration, rotating file output, and context spans.
+//! Structured logging configuration and rotating file output.
 
 use std::{
     fs::{File, OpenOptions, rename},
@@ -9,13 +9,10 @@ use std::{
 };
 
 use chrono::Utc;
-use tracing::Span;
 use tracing_subscriber::{
     EnvFilter, fmt,
     fmt::{time::ChronoUtc, writer::BoxMakeWriter},
 };
-
-use crate::context::OperationContext;
 
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 static INITIALIZE_LOCK: Mutex<()> = Mutex::new(());
@@ -212,37 +209,6 @@ impl Write for SharedWriter {
     }
 }
 
-/// Writes each buffer to every configured destination.
-pub struct MultiWriter {
-    writers: Vec<Box<dyn Write + Send>>,
-}
-
-impl MultiWriter {
-    pub fn new(writers: Vec<Box<dyn Write + Send>>) -> Self {
-        Self { writers }
-    }
-
-    pub fn add(&mut self, writer: Box<dyn Write + Send>) {
-        self.writers.push(writer);
-    }
-}
-
-impl Write for MultiWriter {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        for writer in &mut self.writers {
-            writer.write_all(buffer)?;
-        }
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        for writer in &mut self.writers {
-            writer.flush()?;
-        }
-        Ok(())
-    }
-}
-
 /// Rotates a file when its size or age reaches the configured threshold.
 pub struct FileRotationWriter {
     file: Option<File>,
@@ -337,27 +303,12 @@ impl Write for FileRotationWriter {
     }
 }
 
-/// Creates a span carrying common operation context fields.
-pub fn span(context: &OperationContext) -> Span {
-    let context_fields = serde_json::to_string(&context.fields).unwrap_or_else(|_| "{}".to_owned());
-    tracing::info_span!(
-        "operation",
-        request_id = %context.request_id,
-        trace_id = context.trace_id.as_deref().unwrap_or(""),
-        correlation_id = context.correlation_id.as_deref().unwrap_or(""),
-        user_id = context.user_id.as_deref().unwrap_or(""),
-        service = context.service_name.as_deref().unwrap_or(""),
-        operation = context.operation_name.as_deref().unwrap_or(""),
-        context_fields = %context_fields,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        io::{Cursor, Error, ErrorKind},
+        io::{Cursor, ErrorKind},
         thread,
     };
 
@@ -445,35 +396,6 @@ mod tests {
             assert_eq!(parse_bool("TEST", value), Ok(false));
         }
         assert!(parse_bool("TEST", "sometimes").is_err());
-    }
-
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(Error::new(ErrorKind::BrokenPipe, "closed"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(Error::new(ErrorKind::BrokenPipe, "closed"))
-        }
-    }
-
-    #[test]
-    fn multi_writer_copies_complete_buffers_and_propagates_errors() {
-        let first = Cursor::new(Vec::new());
-        let second = Cursor::new(Vec::new());
-        let mut writer = MultiWriter::new(vec![Box::new(first)]);
-        writer.add(Box::new(second));
-        assert_eq!(writer.write(b"event").unwrap(), 5);
-        writer.flush().unwrap();
-
-        let mut failing = MultiWriter::new(vec![Box::new(FailingWriter)]);
-        assert_eq!(
-            failing.write(b"event").unwrap_err().kind(),
-            ErrorKind::BrokenPipe
-        );
-        assert_eq!(failing.flush().unwrap_err().kind(), ErrorKind::BrokenPipe);
     }
 
     #[test]
@@ -589,20 +511,6 @@ mod tests {
             ..LoggerConfig::default()
         };
         assert!(make_writer(&missing).is_err());
-
-        let context = OperationContext::new()
-            .with_trace_id("trace")
-            .with_correlation_id("correlation")
-            .with_user_id("user")
-            .with_service_name("service")
-            .with_operation_name("operation")
-            .with_field("message_id", "m1");
-        let operation_span = span(&context);
-        assert!(
-            operation_span
-                .metadata()
-                .is_some_and(|metadata| metadata.fields().field("context_fields").is_some())
-        );
     }
 
     #[test]

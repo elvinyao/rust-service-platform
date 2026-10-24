@@ -1,8 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use fake_server::{FakeApiManager, Ports, WebSocketEvent};
-use service_platform::config::RuntimeConfig;
-use service_runtime::app::App;
+use service_runtime::{app::App, config::RuntimeConfig};
 use tokio::time::{sleep, timeout};
 
 #[tokio::test]

@@ -6,7 +6,6 @@ use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use serde_json::Value;
 use service_platform::{
-    config::RuntimeConfig,
     errors::{AppError, ErrorType, Result},
     health::{self, HealthManager},
     ruleengine::Message,
@@ -19,10 +18,13 @@ use tokio::{
 };
 
 use crate::{
-    container::Container,
-    manager::{ServiceManager, Workflow, WorkflowManager},
-    service::{MessageHandler, WEBSOCKET_INPUT_SERVICE_NAME, WebSocketService},
-    workflow::{EngineAdminSnapshot, WorkflowEngine},
+    config::RuntimeConfig,
+    manager::ServiceManager,
+    service::{
+        BadgeDbService, ConfluenceSettingsService, MattermostService, MessageHandler,
+        WebSocketService,
+    },
+    workflow::{AdapterServices, EngineAdminSnapshot, WorkflowEngine},
 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -31,10 +33,8 @@ const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Default)]
 struct AppState {
     started: bool,
-    container: Option<Arc<Container>>,
     health: Option<Arc<HealthManager>>,
     services: Option<Arc<ServiceManager>>,
-    workflows: Option<Arc<WorkflowManager>>,
     workflow_engine: Option<Arc<WorkflowEngine>>,
     admin: Option<Arc<AdminServer>>,
     monitor_shutdown: Option<watch::Sender<bool>>,
@@ -43,10 +43,8 @@ struct AppState {
 
 impl AppState {
     fn has_owned_wiring(&self) -> bool {
-        self.container.is_some()
-            || self.health.is_some()
+        self.health.is_some()
             || self.services.is_some()
-            || self.workflows.is_some()
             || self.workflow_engine.is_some()
             || self.admin.is_some()
             || self.monitor_shutdown.is_some()
@@ -106,17 +104,18 @@ impl App {
         }
         self.config.validate()?;
 
-        let container = Container::new(APP_VERSION, self.config.clone());
-        let health = container.health_manager();
-        let services = container.service_manager();
-        state.container = Some(container.clone());
+        let health = HealthManager::new(Duration::from_secs(30), APP_VERSION);
+        let services = ServiceManager::new(health.clone());
         state.health = Some(health.clone());
         state.services = Some(services.clone());
 
-        if let Err(error) = container.register_services().await {
-            let cleanup = stop_state(&mut state).await.err();
-            return Err(with_cleanup(error, cleanup));
-        }
+        let (websocket, adapters) = match register_services(&services, &self.config).await {
+            Ok(registered) => registered,
+            Err(error) => {
+                let cleanup = stop_state(&mut state).await.err();
+                return Err(with_cleanup(error, cleanup));
+            }
+        };
         let service_start = if services.list().await.is_empty() {
             Ok(())
         } else {
@@ -132,7 +131,7 @@ impl App {
         state.monitor_task = Some(tokio::spawn(services.clone().monitor(monitor_rx)));
 
         let workflow_engine = match WorkflowEngine::new(
-            services.clone(),
+            adapters,
             &self.engine_config_path,
             &self.rules_path,
             &self.config,
@@ -145,29 +144,28 @@ impl App {
                 return Err(with_cleanup(error, cleanup));
             }
         };
-        let workflows = WorkflowManager::new();
-        let workflow: Arc<dyn Workflow> = workflow_engine.clone();
-        if let Err(error) = workflows.register(workflow).await {
-            let _ = workflow_engine.stop().await;
-            let cleanup = stop_state(&mut state).await.err();
-            return Err(with_cleanup(error, cleanup));
-        }
-        state.workflows = Some(workflows.clone());
         state.workflow_engine = Some(workflow_engine.clone());
 
-        let listener_setup = if self.config.inputs.websocket.enabled {
-            setup_message_listener(&services, &workflows).await
-        } else {
-            Ok(())
-        };
-        if let Err(error) = listener_setup {
-            let cleanup = stop_state(&mut state).await.err();
-            return Err(with_cleanup(error, cleanup));
+        if let Some(websocket) = websocket {
+            let engine = workflow_engine.clone();
+            let handler: MessageHandler = Arc::new(move |message: Message| {
+                let engine = engine.clone();
+                Box::pin(async move {
+                    if let Err(error) = engine.process_message(&message).await {
+                        tracing::error!(
+                            message_id = %message.id,
+                            message_type = %message.kind,
+                            error = %error,
+                            "Error processing message"
+                        );
+                    }
+                })
+            });
+            websocket.on_message(handler).await;
         }
 
         let admin_state = AdminApiState {
             services,
-            workflows,
             workflow_engine,
         };
         let router = health::router(health).merge(admin_router(admin_state));
@@ -200,39 +198,62 @@ impl App {
     }
 }
 
-async fn setup_message_listener(
-    services: &Arc<ServiceManager>,
-    workflows: &Arc<WorkflowManager>,
-) -> Result<()> {
-    let service = services
-        .get(WEBSOCKET_INPUT_SERVICE_NAME)
-        .await
-        .ok_or_else(|| {
-            AppError::new(
-                ErrorType::NotFound,
-                format!("Service not found: {WEBSOCKET_INPUT_SERVICE_NAME}"),
-            )
-        })?;
-    let websocket = service
-        .as_any()
-        .downcast_ref::<WebSocketService>()
-        .ok_or_else(|| AppError::new(ErrorType::Internal, "Service is not WebSocketService"))?;
-    let workflows = workflows.clone();
-    let handler: MessageHandler = Arc::new(move |message: Message| {
-        let workflows = workflows.clone();
-        Box::pin(async move {
-            if let Err(error) = workflows.dispatch(&message).await {
-                tracing::error!(
-                    message_id = %message.id,
-                    message_type = %message.kind,
-                    error = %error,
-                    "Error dispatching message"
-                );
-            }
-        })
-    });
-    websocket.on_message(handler).await;
-    Ok(())
+async fn register_services(
+    services: &ServiceManager,
+    config: &RuntimeConfig,
+) -> Result<(Option<Arc<WebSocketService>>, AdapterServices)> {
+    let websocket = if config.inputs.websocket.enabled {
+        let service = Arc::new(WebSocketService::new(
+            config.inputs.websocket.clone(),
+            APP_VERSION,
+        ));
+        services.register(service.clone()).await?;
+        Some(service)
+    } else {
+        None
+    };
+
+    let badgedb = if config.adapters.badgedb.enabled {
+        let service = Arc::new(BadgeDbService::new(
+            config.adapters.badgedb.clone(),
+            APP_VERSION,
+        ));
+        services.register(service.clone()).await?;
+        Some(service)
+    } else {
+        None
+    };
+
+    let mattermost = if config.adapters.mattermost.enabled {
+        let service = Arc::new(MattermostService::new(
+            config.adapters.mattermost.clone(),
+            APP_VERSION,
+        )?);
+        services.register(service.clone()).await?;
+        Some(service)
+    } else {
+        None
+    };
+
+    let confluence = if config.adapters.confluence.enabled {
+        let service = Arc::new(ConfluenceSettingsService::new(
+            config.adapters.confluence.clone(),
+            APP_VERSION,
+        )?);
+        services.register(service.clone()).await?;
+        Some(service)
+    } else {
+        None
+    };
+
+    Ok((
+        websocket,
+        AdapterServices {
+            confluence,
+            badgedb,
+            mattermost,
+        },
+    ))
 }
 
 async fn stop_state(state: &mut AppState) -> Result<()> {
@@ -263,16 +284,7 @@ async fn stop_state_with_timeout(state: &mut AppState, shutdown_timeout: Duratio
             failures.push(format!("stop admin server: {error}"));
         }
     }
-    if let Some(workflows) = state.workflows.clone() {
-        match timeout(shutdown_timeout, workflows.stop_all()).await {
-            Ok(Ok(())) => {
-                state.workflows = None;
-                state.workflow_engine = None;
-            }
-            Ok(Err(error)) => failures.push(format!("stop workflows: {error}")),
-            Err(_) => failures.push("stop workflows: shutdown timed out".to_owned()),
-        }
-    } else if let Some(engine) = state.workflow_engine.clone() {
+    if let Some(engine) = state.workflow_engine.clone() {
         match timeout(shutdown_timeout, engine.stop()).await {
             Ok(Ok(())) => state.workflow_engine = None,
             Ok(Err(error)) => failures.push(format!("stop workflow: {error}")),
@@ -288,7 +300,6 @@ async fn stop_state_with_timeout(state: &mut AppState, shutdown_timeout: Duratio
     }
     if failures.is_empty() {
         state.health = None;
-        state.container = None;
         Ok(())
     } else {
         Err(AppError::new(
@@ -311,7 +322,6 @@ fn with_cleanup(error: AppError, cleanup: Option<AppError>) -> AppError {
 #[derive(Clone)]
 struct AdminApiState {
     services: Arc<ServiceManager>,
-    workflows: Arc<WorkflowManager>,
     workflow_engine: Arc<WorkflowEngine>,
 }
 
@@ -354,15 +364,9 @@ struct WorkflowInfo {
 }
 
 async fn workflows_list(State(state): State<AdminApiState>) -> Json<Vec<WorkflowInfo>> {
-    Json(
-        state
-            .workflows
-            .list()
-            .await
-            .into_iter()
-            .map(|name| WorkflowInfo { name })
-            .collect(),
-    )
+    Json(vec![WorkflowInfo {
+        name: state.workflow_engine.name().to_owned(),
+    }])
 }
 
 async fn rule_engine_info(State(state): State<AdminApiState>) -> Json<EngineAdminSnapshot> {
@@ -372,6 +376,7 @@ async fn rule_engine_info(State(state): State<AdminApiState>) -> Json<EngineAdmi
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         future::pending,
         path::Path,
         sync::atomic::{AtomicUsize, Ordering},
@@ -379,20 +384,42 @@ mod tests {
 
     use async_trait::async_trait;
     use reqwest::StatusCode;
+    use service_platform::{health::ServiceHealth, ruleengine::DEFAULT_WORKFLOW_NAME};
+
+    use crate::service::Service;
 
     use super::*;
 
-    struct RetryStopWorkflow {
+    struct RetryStopService {
         stops: AtomicUsize,
     }
 
     #[async_trait]
-    impl Workflow for RetryStopWorkflow {
+    impl ServiceHealth for RetryStopService {
         fn name(&self) -> &'static str {
             "retry"
         }
 
-        async fn process_message(&self, _message: &Message) -> Result<()> {
+        async fn is_running(&self) -> bool {
+            true
+        }
+
+        async fn metrics(&self) -> BTreeMap<String, Value> {
+            BTreeMap::new()
+        }
+    }
+
+    #[async_trait]
+    impl Service for RetryStopService {
+        fn service_type(&self) -> &'static str {
+            "test"
+        }
+
+        fn workflow(&self) -> &'static str {
+            DEFAULT_WORKFLOW_NAME
+        }
+
+        async fn start(&self) -> Result<()> {
             Ok(())
         }
 
@@ -405,15 +432,34 @@ mod tests {
         }
     }
 
-    struct NeverStopWorkflow;
+    struct NeverStopService;
 
     #[async_trait]
-    impl Workflow for NeverStopWorkflow {
+    impl ServiceHealth for NeverStopService {
         fn name(&self) -> &'static str {
             "never-stop"
         }
 
-        async fn process_message(&self, _message: &Message) -> Result<()> {
+        async fn is_running(&self) -> bool {
+            true
+        }
+
+        async fn metrics(&self) -> BTreeMap<String, Value> {
+            BTreeMap::new()
+        }
+    }
+
+    #[async_trait]
+    impl Service for NeverStopService {
+        fn service_type(&self) -> &'static str {
+            "test"
+        }
+
+        fn workflow(&self) -> &'static str {
+            DEFAULT_WORKFLOW_NAME
+        }
+
+        async fn start(&self) -> Result<()> {
             Ok(())
         }
 
@@ -424,41 +470,40 @@ mod tests {
 
     #[tokio::test]
     async fn failed_cleanup_remains_owned_until_retry_succeeds() {
-        let workflow = Arc::new(RetryStopWorkflow {
+        let health = HealthManager::new(Duration::ZERO, "test");
+        let services = ServiceManager::new(health.clone());
+        let service = Arc::new(RetryStopService {
             stops: AtomicUsize::new(0),
         });
-        let workflows = WorkflowManager::new();
-        workflows.register(workflow.clone()).await.unwrap();
+        services.register(service.clone()).await.unwrap();
         let mut state = AppState {
             started: true,
-            health: Some(HealthManager::new(Duration::ZERO, "test")),
-            workflows: Some(workflows),
+            health: Some(health),
+            services: Some(services),
             ..AppState::default()
         };
 
         assert!(stop_state(&mut state).await.is_err());
         assert!(state.has_owned_wiring());
-        assert!(state.workflows.is_some());
+        assert!(state.services.is_some());
         assert!(state.health.is_some());
 
         stop_state(&mut state).await.unwrap();
-        assert!(state.workflows.is_none());
+        assert!(state.services.is_none());
         assert!(state.health.is_none());
         assert!(!state.has_owned_wiring());
-        assert_eq!(workflow.stops.load(Ordering::SeqCst), 2);
+        assert_eq!(service.stops.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
-    async fn shutdown_bounds_monitor_and_retains_timed_out_workflow() {
-        let workflows = WorkflowManager::new();
-        workflows
-            .register(Arc::new(NeverStopWorkflow))
-            .await
-            .unwrap();
+    async fn shutdown_bounds_monitor_and_retains_timed_out_services() {
+        let health = HealthManager::new(Duration::ZERO, "test");
+        let services = ServiceManager::new(health.clone());
+        services.register(Arc::new(NeverStopService)).await.unwrap();
         let mut state = AppState {
             started: true,
-            health: Some(HealthManager::new(Duration::ZERO, "test")),
-            workflows: Some(workflows),
+            health: Some(health),
+            services: Some(services),
             monitor_task: Some(tokio::spawn(pending())),
             ..AppState::default()
         };
@@ -471,9 +516,9 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(error.contains("stop service monitor: shutdown timed out"));
-        assert!(error.contains("stop workflows: shutdown timed out"));
+        assert!(error.contains("stop services: shutdown timed out"));
         assert!(state.monitor_task.is_none());
-        assert!(state.workflows.is_some());
+        assert!(state.services.is_some());
         assert!(state.health.is_some());
         assert!(state.has_owned_wiring());
     }

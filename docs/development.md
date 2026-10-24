@@ -8,8 +8,8 @@ The project has three boundaries:
 
 | Boundary | Location | Responsibility |
 | --- | --- | --- |
-| Framework SDK | `crates/service-platform` | Rules, composition, pipeline, executors, health, config, logging, concurrency |
-| Reference runtime | `crates/service-runtime` | DI, lifecycle, services, adapters, workflow dispatch, admin API |
+| Framework SDK | `crates/service-platform` | Rules, composition, pipeline, executors, health, config, logging |
+| Reference runtime | `crates/service-runtime` | Lifecycle, runtime config, services, adapters, workflow engine, admin API |
 | Local dependencies | `crates/fake-server` | Confluence-like, Mattermost-like, and WebSocket APIs |
 
 The core framework does not know where a message came from or what a selected action means. Applications connect transports, providers, and executors around the SDK.
@@ -27,7 +27,7 @@ Five objects explain most source code:
 ```text
 transport
   -> Message
-  -> WorkflowManager
+  -> WorkflowEngine
   -> pipeline::Engine
   -> Composer
   -> ExecutionPlan
@@ -41,7 +41,6 @@ main
   -> cli
   -> RuntimeConfig
   -> App
-  -> Container
   -> ServiceManager
   -> WorkflowEngine
   -> AdminServer
@@ -55,16 +54,15 @@ The binary bootstrap is `crates/service-runtime/src/main.rs`. Testable command-l
 2. Load strict `RuntimeConfig`.
 3. Construct `App`.
 4. Validate runtime configuration.
-5. Construct `Container`.
-6. Register enabled services.
-7. Start services concurrently with rollback.
-8. Start the service monitor.
-9. Load and filter `EngineConfig`.
-10. Create providers and executors.
-11. Start the pipeline and run provider/executor preflight.
-12. Connect the WebSocket handler to `WorkflowManager`.
-13. Bind the admin listener.
-14. Return successful startup only after the listener is ready.
+5. Register enabled services in `ServiceManager`.
+6. Start services concurrently with rollback.
+7. Start the service monitor.
+8. Load and filter `EngineConfig`.
+9. Create providers and executors.
+10. Start the pipeline and run provider/executor preflight.
+11. Connect the WebSocket handler to `WorkflowEngine`.
+12. Bind the admin listener.
+13. Return successful startup only after the listener is ready.
 
 Any critical startup error triggers cleanup. Cleanup errors are retained in the returned diagnostic.
 
@@ -77,7 +75,6 @@ POST fake-server :8093/api/send
 -> fake-server broadcast
 -> WebSocketService websocket_loop
 -> MessageHandler
--> WorkflowManager::dispatch
 -> WorkflowEngine::process_message
 -> Engine::process_outcome
 -> Composer::build_execution_plan
@@ -297,9 +294,8 @@ Useful breakpoints:
 | --- | --- |
 | How is config loaded? | `service_runtime::main` |
 | How is startup serialized? | `App::start` |
-| Which services are enabled? | `Container::register_services` |
 | How does reconnect work? | `websocket_loop` |
-| Where are messages dispatched? | `WorkflowManager::dispatch` |
+| Where are messages processed? | `WorkflowEngine::process_message` |
 | How is the plan built? | `Composer::build_execution_plan` |
 | How are actions executed? | `Engine::process_outcome` |
 | How does HTTP execute? | `HttpExecutor::execute` |
@@ -345,8 +341,8 @@ For most async work, CodeLLDB plus structured logs is more productive than raw L
 Read:
 
 1. `crates/service-platform/src/errors.rs`
-2. `crates/service-platform/src/context.rs`
-3. `crates/service-platform/src/config.rs`
+2. `crates/service-platform/src/config.rs`
+3. `crates/service-runtime/src/config.rs`
 4. first half of `ruleengine.rs`
 
 Exercise: introduce an unknown YAML field and observe the exact startup error.
@@ -389,9 +385,8 @@ Read:
 
 1. `service.rs`
 2. `manager.rs`
-3. `container.rs`
-4. `workflow.rs`
-5. `adapters.rs`
+3. `workflow.rs`
+4. `adapters.rs`
 
 Exercise: disable one adapter in a temporary runtime profile and compare `/services` and `/rule-engine`.
 
@@ -885,13 +880,12 @@ Step in this order:
 
 1. fake server `send_event`
 2. runtime `websocket_loop`
-3. `WorkflowManager::dispatch`
-4. `WorkflowEngine::process_message`
-5. `Composer::build_execution_plan`
-6. `Engine::process_outcome`
-7. `LogExecutor::execute`
-8. `MattermostExecutor::execute`
-9. `MattermostService::send_message_to_channel`
+3. `WorkflowEngine::process_message`
+4. `Composer::build_execution_plan`
+5. `Engine::process_outcome`
+6. `LogExecutor::execute`
+7. `MattermostExecutor::execute`
+8. `MattermostService::send_message_to_channel`
 
 ### Controlled Breakages
 
